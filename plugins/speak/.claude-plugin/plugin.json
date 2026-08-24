@@ -8,5 +8,6 @@
   },
   "commands": "./commands/",
   "skills": "./skills/",
-  "homepage": "https://github.com/7x24labs/claude-plugins/tree/main/plugins/speak"
+  "homepage": "https://github.com/7x24labs/claude-plugins/tree/main/plugins/speak",
+  "license": "MIT"
 }
