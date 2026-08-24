@@ -1,0 +1,12 @@
+{
+  "name": "speak",
+  "description": "One-way text-to-speech for Claude Code replies. Toggle with /speak.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Selcuk Arslan",
+    "email": "sarslan@7x24labs.com"
+  },
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "homepage": "https://github.com/7x24labs/claude-plugins/tree/main/plugins/speak"
+}
