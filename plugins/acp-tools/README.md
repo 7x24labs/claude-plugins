@@ -14,7 +14,7 @@ implemented against RFC 6455 directly, in about 350 lines.
 
 ```
 /plugin marketplace add 7x24labs/claude-plugins
-/plugin install acp-tools
+/plugin install acp-tools@7x24labs
 ```
 
 Optionally put it on `PATH`:

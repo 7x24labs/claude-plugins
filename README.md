@@ -6,7 +6,8 @@ Claude Code plugin marketplace. Each plugin lives under `plugins/<name>/`.
 
 ```
 /plugin marketplace add 7x24labs/claude-plugins
-/plugin install speak
+/plugin install speak@7x24labs
+/plugin install acp-tools@7x24labs
 ```
 
 ## Plugins
