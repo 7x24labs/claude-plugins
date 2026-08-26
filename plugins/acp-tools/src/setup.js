@@ -1,9 +1,15 @@
 'use strict';
 // `acp-setup` -- first-run setup for the parts of acp-tools that are not just
-// files in this repo: the acp-ui web client has to be fetched and built.
+// files in this repo: the commands want to be on PATH, and the acp-ui web
+// client has to be fetched and built.
 //
-//   git clone 7x24labs/acp-ui  ->  npm install  ->  vite build  ->  publish
-//   dist/ into the plugin's ui/ directory, where `acp-ui serve` finds it.
+//   link bin/* into ~/.local/bin
+//   git clone 7x24labs/acp-ui  ->  npm install  ->  vite build  ->  copy
+//   dist/ into the plugin's ui/ directory, where `acp-ui` serves it from
+//
+// The checkout is a means to an end, so it is cloned into a temporary
+// directory and removed once dist/ has been copied out -- only the built UI
+// is kept. That costs a fresh clone and a fresh npm install on every run.
 //
 // Run it after installing the plugin, and again to pick up a newer acp-ui.
 
@@ -16,10 +22,14 @@ const { UI_ROOT, DEFAULT_PORT } = require('./ui');
 const REPO = process.env.ACP_UI_REPO || 'https://github.com/7x24labs/acp-ui.git';
 const REF = process.env.ACP_UI_REF || 'main';
 
-// Where the checkout lives between builds. Kept outside the plugin so a plugin
-// update never wipes it, and so npm's node_modules survives for the next build.
-const SRC_DIR = process.env.ACP_UI_SRC
-  || path.join(process.env.ACP_HOME || path.join(os.homedir(), '.acp'), 'build', 'acp-ui');
+// Where the throwaway checkout is made. Under ACP_HOME rather than /tmp so a
+// build that dies mid-flight leaves its mess somewhere findable, and so the
+// clone and its destination sit on the same filesystem.
+const WORK_DIR = process.env.ACP_UI_WORK
+  || path.join(process.env.ACP_HOME || path.join(os.homedir(), '.acp'), 'build');
+
+const BIN_DIR = path.resolve(__dirname, '..', 'bin');
+const LINK_DIR = process.env.ACP_LINK_DIR || path.join(os.homedir(), '.local/bin');
 
 const out = (s = '') => process.stdout.write(s + '\n');
 
@@ -46,21 +56,87 @@ function capture(cmd, args, cwd) {
 
 // --------------------------------------------------------------------- steps
 
-// Clone on first run, fast-forward to the tip of REF after that.
-function sync(srcDir) {
-  if (fs.existsSync(path.join(srcDir, '.git'))) {
-    out(`updating ${srcDir} (${REF})`);
-    run('git', ['remote', 'set-url', 'origin', REPO], srcDir);
-    run('git', ['fetch', '--depth', '1', 'origin', REF], srcDir);
-    run('git', ['reset', '--hard', 'FETCH_HEAD'], srcDir);
-    run('git', ['clean', '-fd'], srcDir);   // untracked, but not ignored: node_modules stays
-  } else {
-    out(`cloning ${REPO} -> ${srcDir}`);
-    fs.mkdirSync(path.dirname(srcDir), { recursive: true });
-    fs.rmSync(srcDir, { recursive: true, force: true });
-    run('git', ['clone', '--depth', '1', '--branch', REF, REPO, srcDir]);
+// The checkout in flight. A normal failure unwinds through `finally` and takes
+// it with us; a kill does not -- every step here is synchronous, so the event
+// loop never turns to run a signal handler, and installing one would only stop
+// Ctrl-C from working. The sweep below is what makes that harmless.
+let pendingClone = null;
+
+function discardPendingClone() {
+  if (!pendingClone) return;
+  fs.rmSync(pendingClone, { recursive: true, force: true });
+  pendingClone = null;
+}
+
+// Anything matching acp-ui-* in the work dir is a clone of ours that outlived
+// its run -- an earlier setup that was killed. Sweeping at the start rather
+// than at the end is deliberate: a killed run leaves npm still writing into
+// that directory for a while, so only the next run can safely clear it.
+function sweepStaleClones() {
+  for (const entry of (() => { try { return fs.readdirSync(WORK_DIR); } catch { return []; } })()) {
+    if (!entry.startsWith('acp-ui-')) continue;
+    const stale = path.join(WORK_DIR, entry);
+    out(`removing leftover checkout ${stale}`);
+    fs.rmSync(stale, { recursive: true, force: true });
   }
-  return capture('git', ['rev-parse', 'HEAD'], srcDir);
+}
+
+// A shallow clone into a directory we own and will delete.
+function clone() {
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  sweepStaleClones();
+  const dir = fs.mkdtempSync(path.join(WORK_DIR, 'acp-ui-'));
+  pendingClone = dir;
+  out(`cloning ${REPO} (${REF})`);
+  try {
+    run('git', ['clone', '--depth', '1', '--branch', REF, REPO, dir]);
+  } catch (err) {
+    discardPendingClone();   // never leave an empty shell behind
+    throw err;
+  }
+  return dir;
+}
+
+// Put the commands where a shell will find them. An existing link of ours is
+// repointed; anything else with that name is left alone and reported.
+function linkCommands(linkDir = LINK_DIR) {
+  out(`linking commands into ${linkDir}`);
+  fs.mkdirSync(linkDir, { recursive: true });
+
+  for (const name of fs.readdirSync(BIN_DIR).sort()) {
+    const target = path.join(BIN_DIR, name);
+    const link = path.join(linkDir, name);
+
+    let existing = null;
+    try { existing = fs.lstatSync(link); } catch { /* nothing there */ }
+
+    if (existing) {
+      if (!existing.isSymbolicLink()) {
+        out(`  ${name}: a file is already there, leaving it alone`);
+        continue;
+      }
+      const current = fs.readlinkSync(link);
+      if (path.resolve(path.dirname(link), current) === target) {
+        out(`  ${name}: already linked`);
+        continue;
+      }
+      // Only reclaim a link that points at some copy of this plugin.
+      if (!current.includes('acp-tools')) {
+        out(`  ${name}: points at ${current}, leaving it alone`);
+        continue;
+      }
+      fs.unlinkSync(link);
+      fs.symlinkSync(target, link);
+      out(`  ${name}: repointed from ${current}`);
+      continue;
+    }
+
+    fs.symlinkSync(target, link);
+    out(`  ${name}: linked`);
+  }
+
+  const onPath = (process.env.PATH || '').split(path.delimiter).includes(linkDir);
+  if (!onPath) out(`  note: ${linkDir} is not on your PATH`);
 }
 
 // acp-ui's `overrides` pin the TypeScript peer of typescript-eslint below the
@@ -111,61 +187,79 @@ function publish(distDir, destDir, info) {
   fs.rmSync(previous, { recursive: true, force: true });
 }
 
-function buildUi({ srcDir = SRC_DIR, destDir = UI_ROOT, skipSync = false } = {}) {
-  if (!capture('git', ['--version'])) throw new Error('git is required to build the UI');
-
-  const commit = skipSync ? capture('git', ['rev-parse', 'HEAD'], srcDir) : sync(srcDir);
-
-  const uiDir = path.join(srcDir, 'src', 'ui');
-  if (!fs.existsSync(path.join(uiDir, 'package.json'))) {
-    throw new Error(`no UI package.json at ${uiDir} -- has the acp-ui layout changed?`);
+function buildUi({ srcDir = null, destDir = UI_ROOT } = {}) {
+  if (!srcDir && !capture('git', ['--version'])) {
+    throw new Error('git is required to fetch the UI');
   }
 
-  install(uiDir);
+  // --src builds a checkout the caller owns; anything we clone, we delete.
+  const disposable = !srcDir;
+  const dir = srcDir || clone();
 
-  out('building');
-  run('npm', ['run', 'build'], uiDir);
+  try {
+    const commit = capture('git', ['rev-parse', 'HEAD'], dir);
 
-  const distDir = path.join(uiDir, 'dist');
-  if (!fs.existsSync(path.join(distDir, 'index.html'))) {
-    throw new Error(`build produced no index.html in ${distDir}`);
+    const uiDir = path.join(dir, 'src', 'ui');
+    if (!fs.existsSync(path.join(uiDir, 'package.json'))) {
+      throw new Error(`no UI package.json at ${uiDir} -- has the acp-ui layout changed?`);
+    }
+
+    install(uiDir);
+
+    out('building');
+    run('npm', ['run', 'build'], uiDir);
+
+    const distDir = path.join(uiDir, 'dist');
+    if (!fs.existsSync(path.join(distDir, 'index.html'))) {
+      throw new Error(`build produced no index.html in ${distDir}`);
+    }
+
+    publish(distDir, destDir, {
+      repo: REPO,
+      ref: REF,
+      commit,
+      builtAt: new Date().toISOString(),
+      node: process.version,
+    });
+
+    out('');
+    out(`published ${destDir}`);
+    out(`  commit  ${commit.slice(0, 12) || '(unknown)'}`);
+    out(`  files   ${fs.readdirSync(destDir).length} entries`);
+    out(`  serve   acp-ui --port ${DEFAULT_PORT}`);
+  } finally {
+    // The dist/ we wanted is copied out by now, so the checkout is spent --
+    // drop it whether the build worked or not.
+    if (disposable) {
+      discardPendingClone();
+      out(`  cleaned ${dir}`);
+    }
   }
-
-  publish(distDir, destDir, {
-    repo: REPO,
-    ref: REF,
-    commit,
-    builtAt: new Date().toISOString(),
-    node: process.version,
-  });
-
-  out('');
-  out(`published ${destDir}`);
-  out(`  commit  ${commit.slice(0, 12) || '(unknown)'}`);
-  out(`  files   ${fs.readdirSync(destDir).length} entries`);
-  out(`  serve   acp-ui --port ${DEFAULT_PORT}`);
 }
 
 // ----------------------------------------------------------------------- cli
 
 function usage() {
-  out(`acp-setup -- set up acp-tools' web client
+  out(`acp-setup -- set up acp-tools
 
-  acp-setup [--src DIR] [--dest DIR] [--no-sync]
+  acp-setup [--src DIR] [--dest DIR] [--link-dir DIR] [--no-link] [--no-ui]
 
-Clones or updates ${REPO} (${REF}),
-installs its dependencies, builds it, and publishes the result where
-\`acp-ui\` serves it from. Re-run it to pick up a newer acp-ui.
+Links this plugin's commands into ${LINK_DIR}, then clones
+${REPO} (${REF}) into a temporary
+directory, builds it, copies dist/ to where \`acp-ui\` serves it from, and
+deletes the checkout. Re-run it to pick up a newer acp-ui.
 
-  --src DIR    checkout to build from   (default ${SRC_DIR})
-  --dest DIR   publish the build here   (default ${UI_ROOT})
-  --no-sync    build the checkout as it stands, skipping git
+  --src DIR       build this checkout instead of cloning (it is never deleted)
+  --dest DIR      copy the build here    (default ${UI_ROOT})
+  --link-dir DIR  link commands here     (default ${LINK_DIR})
+  --no-link       skip linking commands
+  --no-ui         only link commands, skip the UI build
 
-Env: ACP_UI_REPO, ACP_UI_REF, ACP_UI_SRC, ACP_UI_DEST`);
+Env: ACP_UI_REPO, ACP_UI_REF, ACP_UI_WORK, ACP_UI_DEST, ACP_LINK_DIR`);
 }
 
 function parse(argv) {
-  const VALUE = new Set(['src', 'dest']);
+  const VALUE = new Set(['src', 'dest', 'link-dir']);
   const flags = {};
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
@@ -190,10 +284,13 @@ function main(argv) {
     process.exit(2);
   }
 
+  if (!flags['no-link']) linkCommands(flags['link-dir'] ? path.resolve(flags['link-dir']) : LINK_DIR);
+  if (flags['no-ui']) return;
+  if (!flags['no-link']) out('');
+
   buildUi({
-    srcDir: flags.src ? path.resolve(flags.src) : SRC_DIR,
+    srcDir: flags.src ? path.resolve(flags.src) : null,
     destDir: flags.dest ? path.resolve(flags.dest) : UI_ROOT,
-    skipSync: Boolean(flags['no-sync']),
   });
 }
 
@@ -204,4 +301,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { buildUi, SRC_DIR };
+module.exports = { buildUi, linkCommands, WORK_DIR, LINK_DIR };

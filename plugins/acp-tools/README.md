@@ -29,7 +29,7 @@ ln -s $plugin/bin/acp-setup ~/.local/bin/acp-setup
 Link a checkout's `bin/` instead if you are working on the plugin -- the shims
 resolve through symlinks, so either target works.
 
-Then, if you want the web UI, run setup once:
+Or let setup do the linking, along with building the web UI:
 
 ```
 acp-setup
@@ -121,7 +121,7 @@ itself.
 [ui]: https://github.com/7x24labs/acp-ui
 
 ```
-acp-setup       # clone/update acp-ui, npm install, vite build, publish dist/
+acp-setup       # link commands, then clone acp-ui, build it, keep only dist/
 acp-ui          # static-serve it on http://127.0.0.1:8000
 ```
 
@@ -130,16 +130,24 @@ runs all day has no build machinery in it, and re-running setup does not
 interrupt serving.
 
 ```
-acp-setup [--src DIR] [--dest DIR] [--no-sync]
+acp-setup [--src DIR] [--dest DIR] [--link-dir DIR] [--no-link] [--no-ui]
 acp-ui    [--port N] [--host H] [--root DIR] [-v]
 ```
 
-The checkout lives in `~/.acp/build/acp-ui` and the build is published to
-`~/.claude/plugins/marketplaces/7x24labs/plugins/acp-tools/ui`. Both move with
-`ACP_UI_SRC` / `ACP_UI_DEST`; `ACP_UI_REPO`, `ACP_UI_REF`, `ACP_UI_PORT` and
-`ACP_UI_HOST` cover the rest. `--no-sync` builds the checkout as it stands,
-which is what you want when you are editing the UI locally. Re-run `acp-setup`
-to pick up a newer acp-ui.
+Setup clones into a temporary directory under `~/.acp/build`, builds, copies
+`dist/` to `~/.claude/plugins/marketplaces/7x24labs/plugins/acp-tools/ui`, and
+deletes the checkout -- only the built UI is kept, so every run pays for a
+fresh clone and a fresh `npm install` (about half a minute). A run that is
+killed leaves its checkout behind; the next run sweeps it. `--src DIR` builds a
+checkout you already have, and never deletes it -- that is the one to use while
+editing the UI locally.
+
+`--dest` and `--link-dir` move the destinations; `ACP_UI_REPO`, `ACP_UI_REF`,
+`ACP_UI_WORK`, `ACP_UI_DEST`, `ACP_LINK_DIR`, `ACP_UI_PORT` and `ACP_UI_HOST`
+are the environment equivalents. Re-run `acp-setup` to pick up a newer acp-ui.
+
+Linking is idempotent: a link setup already made is repointed, and a real file
+or a symlink to something else with that name is reported and left alone.
 
 The destination is swapped in only after a successful build, so a broken build
 leaves the previously published UI serving. Fingerprinted `assets/` are sent
