@@ -1,0 +1,13 @@
+{
+  "name": "acp-tools",
+  "description": "Let Claude delegate work to other AI agents over the Agent Client Protocol. Register peers, open sessions, and hold multi-turn conversations across machines.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Selcuk Arslan",
+    "email": "sarslan@7x24labs.com"
+  },
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "homepage": "https://github.com/7x24labs/claude-plugins/tree/main/plugins/acp-tools",
+  "license": "MIT"
+}

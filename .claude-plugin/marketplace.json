@@ -19,6 +19,17 @@
       "source": "./plugins/speak",
       "category": "productivity",
       "homepage": "https://github.com/7x24labs/claude-plugins/tree/main/plugins/speak"
+    },
+    {
+      "name": "acp-tools",
+      "description": "Agent-to-agent messaging over the Agent Client Protocol. Register peer agents, open sessions, and hold multi-turn conversations across machines.",
+      "author": {
+        "name": "Selcuk Arslan",
+        "email": "sarslan@7x24labs.com"
+      },
+      "source": "./plugins/acp-tools",
+      "category": "productivity",
+      "homepage": "https://github.com/7x24labs/claude-plugins/tree/main/plugins/acp-tools"
     }
   ]
 }

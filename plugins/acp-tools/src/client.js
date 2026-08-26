@@ -1,0 +1,137 @@
+'use strict';
+// Client side: open a registered agent, run the ACP handshake, keep the
+// session registry in the config file up to date.
+
+const path = require('node:path');
+const acp = require('./acp');
+const transport = require('./transport');
+const { Peer } = require('./jsonrpc');
+const config = require('./config');
+
+function lookupAgent(cfg, name) {
+  const a = cfg.agents[name];
+  if (!a) {
+    const known = Object.keys(cfg.agents);
+    throw new Error(`unknown agent: ${name}` +
+      (known.length ? ` -- registered: ${known.join(', ')}` : ' -- none registered yet, use `acp agent add`'));
+  }
+  return a;
+}
+
+// onUpdate(updateParams) receives forwarded session/update notifications.
+async function connectAgent(cfg, name, { onUpdate, verbose = false, timeoutMs } = {}) {
+  const agentCfg = lookupAgent(cfg, name);
+  let channel;
+  try {
+    channel = await transport.open(agentCfg, {
+      timeoutMs,
+      onStderr: (d) => { if (verbose) process.stderr.write(`[${name}] ${d}`); },
+    });
+  } catch (err) {
+    const hint =
+      err.code === 'ECONNREFUSED' || /ECONNREFUSED/.test(err.message)
+        ? ` -- nothing is listening there. Start the daemon on that host with \`acp serve\`.`
+        : /401/.test(err.message)
+          ? ` -- the daemon rejected the token. Check \`acp agent add ${name} ... --token\` against its config.json.`
+          : /ENOTFOUND|EAI_AGAIN/.test(err.message)
+            ? ` -- host not found; check the url.`
+            : '';
+    throw new Error(`cannot reach agent "${name}" at ${agentCfg.url}: ${err.message}${hint}`);
+  }
+
+  let closedReason = null;
+  channel.onClose((r) => { closedReason = r; });
+
+  const peer = new Peer(channel, {
+    name,
+    onError: (err) => { if (verbose) process.stderr.write(`[${name}] ${err.message}\n`); },
+  });
+
+  peer.handle('session/update', (p) => { if (onUpdate) onUpdate(p); });
+
+  // Only reached when talking straight to a stdio agent -- against a daemon
+  // these terminate on the far side, next to the repo.
+  acp.installFsHandlers(peer, {
+    fsScope: agentCfg.fsScope || 'session-cwd',
+    scopeFor: () => [agentCfg.cwd || process.cwd()],
+  });
+  peer.handle('session/request_permission', (p) =>
+    acp.decidePermission(p, agentCfg.permissionMode || 'allow'));
+
+  const info = await acp.initialize(peer, { clientName: 'acp-cli' });
+
+  return {
+    name, peer, channel, info, agentCfg,
+    get closedReason() { return closedReason; },
+    close() { try { peer.close(); } catch { /* gone */ } },
+  };
+}
+
+// ------------------------------------------------- local session bookkeeping
+
+function rememberSession(agent, sessionId, fields) {
+  config.update((cfg) => {
+    const key = config.sessionKey(agent, sessionId);
+    const prev = cfg.sessions[key] || {};
+    cfg.sessions[key] = Object.assign({
+      agent, sessionId, state: 'active',
+      createdAt: new Date().toISOString(), turns: 0,
+    }, prev, fields, { updatedAt: new Date().toISOString() });
+  });
+}
+
+function forgetSession(agent, sessionId) {
+  config.update((cfg) => { delete cfg.sessions[config.sessionKey(agent, sessionId)]; });
+}
+
+function listSessions(cfg, agent) {
+  return Object.values(cfg.sessions)
+    .filter((s) => !agent || s.agent === agent)
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+}
+
+// Most recently used session that can still take a prompt.
+function latestUsable(cfg, agent) {
+  return listSessions(cfg, agent).find((s) => s.state === 'active') || null;
+}
+
+function isKnownSession(cfg, agent, id) {
+  return Boolean(cfg.sessions[config.sessionKey(agent, id)]);
+}
+
+// A `stdio:` agent is a fresh process per CLI invocation, so a session made by
+// an earlier command is not in its memory. ACP's session/load restores it.
+// A ws:// daemon keeps sessions live, so nothing is needed there.
+async function ensureLive(conn, sessionId, cwd) {
+  if (!conn._loaded) conn._loaded = new Set();
+  if (conn._loaded.has(sessionId)) return;
+  conn._loaded.add(sessionId);
+  if (conn.channel.kind !== 'stdio') return;
+
+  const caps = conn.info.agentCapabilities || {};
+  if (!caps.loadSession) {
+    throw new Error(
+      `agent "${conn.name}" does not support session/load, so a session cannot ` +
+      `outlive one command. Use \`acp chat ${conn.name}\` for multi-turn, or put ` +
+      `it behind a ws:// daemon (acp serve) which keeps sessions in memory.`);
+  }
+  await conn.peer.request('session/load', {
+    sessionId, cwd: path.resolve(cwd || conn.agentCfg.cwd || process.cwd()), mcpServers: [],
+  }, { timeoutMs: 180000 });
+}
+
+async function newSession(conn, cwd) {
+  const dir = path.resolve(cwd || conn.agentCfg.cwd || process.cwd());
+  const res = await conn.peer.request('session/new',
+    { cwd: dir, mcpServers: [] }, { timeoutMs: 180000 });
+  if (!res || !res.sessionId) throw new Error(`${conn.name}: agent returned no sessionId`);
+  rememberSession(conn.name, res.sessionId, { cwd: dir, state: 'active' });
+  if (!conn._loaded) conn._loaded = new Set();
+  conn._loaded.add(res.sessionId);   // freshly created: already live
+  return res;
+}
+
+module.exports = {
+  lookupAgent, connectAgent, rememberSession, forgetSession,
+  listSessions, latestUsable, isKnownSession, newSession, ensureLive,
+};
