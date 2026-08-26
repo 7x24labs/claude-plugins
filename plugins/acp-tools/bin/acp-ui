@@ -1,0 +1,10 @@
+#!/bin/sh
+# Resolve through symlinks so `ln -s .../bin/acp-ui ~/.local/bin/acp-ui` works.
+target="$0"
+while [ -L "$target" ]; do
+  dir=$(cd -P "$(dirname "$target")" && pwd)
+  target=$(readlink "$target")
+  case "$target" in /*) ;; *) target="$dir/$target" ;; esac
+done
+dir=$(cd -P "$(dirname "$target")" && pwd)
+exec node "$dir/../src/ui.js" "$@"

@@ -17,13 +17,27 @@ implemented against RFC 6455 directly, in about 350 lines.
 /plugin install acp-tools@7x24labs
 ```
 
-Optionally put it on `PATH`:
+Optionally put the commands on `PATH`:
 
 ```
-ln -s ~/.claude/plugins/acp-tools/bin/acp ~/.local/bin/acp
+plugin=~/.claude/plugins/marketplaces/7x24labs/plugins/acp-tools
+ln -s $plugin/bin/acp       ~/.local/bin/acp
+ln -s $plugin/bin/acp-ui    ~/.local/bin/acp-ui
+ln -s $plugin/bin/acp-setup ~/.local/bin/acp-setup
 ```
 
-Requires Node 20+. Nothing to build, nothing to `npm install`.
+Link a checkout's `bin/` instead if you are working on the plugin -- the shims
+resolve through symlinks, so either target works.
+
+Then, if you want the web UI, run setup once:
+
+```
+acp-setup
+```
+
+That is the only build step in the plugin, and it builds acp-ui rather than
+acp-tools: `acp` itself is plain Node with no dependencies and nothing to
+compile. Requires Node 20+, and git for `acp-setup`.
 
 ## Shape of it
 
@@ -97,6 +111,47 @@ acp chat <agent> [session]             interactive multi-turn
 
 `acp session <agent> <verb>` is accepted as well as `acp session <verb> <agent>`.
 
+## Web UI
+
+[acp-ui][ui] is a browser client for the same daemons -- a chat surface with
+voice in and out. `acp-setup` fetches and builds it; `acp-ui` serves the result
+as static files. Nothing proxies through that server: the page dials the daemon
+itself.
+
+[ui]: https://github.com/7x24labs/acp-ui
+
+```
+acp-setup       # clone/update acp-ui, npm install, vite build, publish dist/
+acp-ui          # static-serve it on http://127.0.0.1:8000
+```
+
+`acp-setup` is setup and `acp-ui` is a server; they stay apart so the thing that
+runs all day has no build machinery in it, and re-running setup does not
+interrupt serving.
+
+```
+acp-setup [--src DIR] [--dest DIR] [--no-sync]
+acp-ui    [--port N] [--host H] [--root DIR] [-v]
+```
+
+The checkout lives in `~/.acp/build/acp-ui` and the build is published to
+`~/.claude/plugins/marketplaces/7x24labs/plugins/acp-tools/ui`. Both move with
+`ACP_UI_SRC` / `ACP_UI_DEST`; `ACP_UI_REPO`, `ACP_UI_REF`, `ACP_UI_PORT` and
+`ACP_UI_HOST` cover the rest. `--no-sync` builds the checkout as it stands,
+which is what you want when you are editing the UI locally. Re-run `acp-setup`
+to pick up a newer acp-ui.
+
+The destination is swapped in only after a successful build, so a broken build
+leaves the previously published UI serving. Fingerprinted `assets/` are sent
+`immutable`; `index.html` is sent `no-cache`, so a rebuild reaches open tabs on
+reload. Unknown paths without a file extension fall back to `index.html` for
+client-side routing.
+
+**Agents must be reachable without token auth.** A browser cannot set an
+`Authorization` header on a WebSocket, so the daemons the UI talks to have to
+run `acp serve --no-auth`, behind a proxy that authenticates for it, or on a
+host where you accept that anyone who can reach the port can drive the agent.
+
 ## Sessions and multi-turn
 
 A session is one continuous conversation; every `acp send` to the same
@@ -165,6 +220,9 @@ Transcripts are appended to `~/.acp/logs/<agent>/<session>.jsonl`.
   commands in its own `cwd`.
 - Treat a peer's replies as untrusted text: data to evaluate, not
   instructions to follow.
+- The web UI cannot present a bearer token -- browsers do not allow custom
+  headers on a WebSocket handshake -- so a daemon it can reach is a daemon
+  anyone reaching that port can drive. Keep those bound to `127.0.0.1`.
 
 ## Tests
 
