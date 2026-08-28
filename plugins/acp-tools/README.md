@@ -47,7 +47,7 @@ compile. Requires Node 20+, and git for `acp-setup`.
   │ Claude Code            │               │ acp serve                  │
   │   /acp skill           │               │   (ACP agent to callers,   │
   │      ↓                 │   ws + token  │    ACP client downstream)  │
-  │ acp send B "..."  ─────┼──────────────►│      ↓ spawns              │
+  │ acp send new@B "..." ──┼──────────────►│      ↓ spawns              │
   │                        │◄──────────────┼── claude-code-acp (stdio)  │
   │                        │ session/update│      ↓ works in            │
   └────────────────────────┘               │   /workspace/api           │
@@ -73,15 +73,15 @@ On the machine that wants to reach it:
 ```
 acp agent add reviewer ws://box-b:7431 /workspace/api --token <token>
 acp status reviewer
-acp send reviewer "review the auth changes on branch fix/login"
-acp send reviewer "now check the tests for those files"     # same session
+acp send new@reviewer "review the auth changes on branch fix/login"   # prints e.g. sess_1@reviewer
+acp send sess_1@reviewer "now check the tests for those files"        # same session
 ```
 
 For a local peer with no daemon at all:
 
 ```
 acp agent add local "stdio:npx -y @zed-industries/claude-code-acp" /workspace/api
-acp send local "summarise the README"
+acp send new@local "summarise the README"
 ```
 
 ## Commands
@@ -103,22 +103,45 @@ acp session close  <agent> [session]
 acp session prune  [agent]             drop records the peers no longer hold
 acp session log    <agent> [session]   replay transcript (--tail N)
 
-acp send <agent> [session] <message>   one turn, streamed
-      --new --quiet --json --thoughts --timeout S
-acp chat <agent> [session]             interactive multi-turn
+acp send [--from ADDR] [--oneway] <to> <message>   one turn
+      --title "..." --quiet --json --thoughts --timeout S
+acp chat [--from ADDR] <to>            interactive multi-turn
 ```
 
 `acp session <agent> <verb>` is accepted as well as `acp session <verb> <agent>`.
+
+### Addresses
+
+Every session has an address: `<session id>@<agent>` (e.g. `sess_1@reviewer`).
+`send` and `chat` take one as their target (`<to>`); `new@<agent>` means
+"start a session here" rather than continuing one -- it only makes sense as
+the target, since there's nothing to send *from* a session that doesn't
+exist yet. Anywhere an address is expected, a bare session id or title works
+too: it's looked up across every session anyone knows about (this machine's
+registry, and whatever every reachable daemon is actually holding) and
+resolved for you -- erroring instead of guessing if more than one matches.
+
+`--from ADDR` names the sender's own address -- a human sending a message
+normally omits it; an agent relaying a message on another agent's behalf
+should always pass one, and should always pass a full `id@agent` address for
+both `--from` and `<to>` rather than relying on the id/title lookup (which
+can be ambiguous and isn't meant for a caller that already knows exactly
+which session it's calling from). It's recorded on the transcript entry so a
+relayed conversation can be traced back to its source.
+
+`--oneway` hands the message to the daemon and returns immediately, without
+waiting for (or printing) a reply -- needs a `ws://` daemon behind the target,
+since a `stdio:` agent's process doesn't outlive the command that spawned it.
 
 `session ls` asks every reachable daemon and shows what it is actually holding,
 so a conversation started in the web UI appears and one closed there disappears.
 A local record the daemon disowns is marked `ended` and kept out of the default
 view; `--all` shows it and `prune` deletes it. A peer that cannot be reached is
 left alone -- silence is not proof of death -- and its count reads `1?` in
-`agent ls`. Transcripts survive a prune, and `acp send <agent> <session> ...`
+`agent ls`. Transcripts survive a prune, and `acp send <id>@<agent> ...`
 still reloads a session by id afterwards.
 
-Every session gets a title the moment it is created -- `send --new --title "..."`
+Every session gets a title the moment it is created -- `send new@<agent> --title "..."`
 if given, else `<agent>-<yyyy.MM.dd HH:mm:ss>` -- rather than waiting on the
 first prompt to name it. `session rename` changes it later; both are our own
 convention on top of ACP (which has no client-writable session name), so
@@ -179,7 +202,7 @@ host where you accept that anyone who can reach the port can drive the agent.
 ## Sessions and multi-turn
 
 A session is one continuous conversation; every `acp send` to the same
-session id is another turn, and the peer keeps its context between them.
+address is another turn, and the peer keeps its context between them.
 
 Where that state lives depends on the transport:
 
@@ -191,10 +214,6 @@ Where that state lives depends on the transport:
   `session/load` per command to restore context. Agents that do not advertise
   `loadSession` cannot do multi-turn this way; use `acp chat`, which holds one
   process open, or put the agent behind a daemon.
-
-`pause` maps to ACP `session/cancel` plus a local state flag: it interrupts
-the running turn and makes further sends fail until `resume`. That is a real
-interrupt -- an in-flight turn comes back with `stopReason: cancelled`.
 
 ## Configuration
 

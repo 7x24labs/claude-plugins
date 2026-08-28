@@ -77,7 +77,7 @@ async function handle(m) {
         let answer;
         try {
           answer = execFileSync(process.env.ACP_BIN,
-            ['send', peer, '--quiet', msg.join(' ')], { encoding: 'utf8' }).trim();
+            ['send', `new@${peer}`, '--quiet', msg.join(' ')], { encoding: 'utf8' }).trim();
         } catch (e) { answer = 'relay failed: ' + (e.stderr || e.message); }
         note('session/update', { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'r1', title: 'consult ' + peer, kind: 'other', status: 'completed' } });
         note('session/update', { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: peer + ' replied: ' + answer } } });

@@ -28,18 +28,21 @@ trap cleanup EXIT
 mkrepo() { mkdir -p "$WORK/$1"; echo "content of $1" > "$WORK/$1/note.txt"; }
 mkrepo repo; mkrepo repo2
 
-# `acp session new` is gone -- a session is now only created via `send --new`
-# (or `chat --new`). This drives one real turn to create one and prints its
-# id, same shape the old `session new` gave callers below. `--json` streams
-# one line per update plus a final result line -- only the last line is the
-# {sessionId, stopReason, text} result.
+# `acp session new` is gone -- a session is now only created via
+# `send new@<agent>` (or `chat new@<agent>`). This drives one real turn to
+# create one and prints its bare id (not the "id@agent" address -- callers
+# below build that themselves), same shape the old `session new` gave
+# callers below. `--json` streams one line per update plus a final result
+# line -- only the last line is the {sessionId, stopReason, text} result, and
+# `sessionId` there is itself an address, so split off the "@agent" part.
 new_session() { # new_session <agent> [more send flags...]
-  "$ACP_BIN" send "$@" --new --json hello 2>/dev/null | node -e '
+  local agent="$1"; shift
+  "$ACP_BIN" send "new@$agent" "$@" --json hello 2>/dev/null | node -e '
     let d = "";
     process.stdin.on("data", (c) => { d += c; });
     process.stdin.on("end", () => {
       const lines = d.trim().split("\n");
-      try { process.stdout.write(JSON.parse(lines[lines.length - 1]).sessionId || ""); } catch { /* empty */ }
+      try { process.stdout.write(JSON.parse(lines[lines.length - 1]).sessionId.split("@")[0] || ""); } catch { /* empty */ }
     });
   '
 }
@@ -67,11 +70,13 @@ check "agent add"    'added agent "local"' "$("$ACP_BIN" agent add local "stdio:
 check "agent ls"     'local'               "$("$ACP_BIN" agent ls 2>&1)"
 SID=$(new_session local)
 check "send --new creates a session" 'sess_' "$SID"
-check "turn 1"       'you said "one"'      "$("$ACP_BIN" send local "$SID" --quiet one 2>&1)"
-check "turn 2 reuses session" 'you said "two"' "$("$ACP_BIN" send local --quiet two 2>&1)"
+check "turn 1"       'you said "one"'      "$("$ACP_BIN" send "$SID@local" --quiet one 2>&1)"
+check "turn 2 same address" 'you said "two"' "$("$ACP_BIN" send "$SID@local" --quiet two 2>&1)"
 check "turn count"   'local  '             "$("$ACP_BIN" session ls 2>&1)"
-check "fs read"      'content of repo'     "$("$ACP_BIN" send local --quiet "read $WORK/repo/note.txt" 2>&1)"
-check "fs scope"     'outside the session scope' "$("$ACP_BIN" send local --quiet "read /etc/hostname" 2>&1)"
+check "fs read"      'content of repo'     "$("$ACP_BIN" send "$SID@local" --quiet "read $WORK/repo/note.txt" 2>&1)"
+check "fs scope"     'outside the session scope' "$("$ACP_BIN" send "$SID@local" --quiet "read /etc/hostname" 2>&1)"
+check "--oneway refused against a stdio agent" '--oneway needs a daemon' \
+  "$("$ACP_BIN" send "$SID@local" --oneway "nope" 2>&1)"
 check "stdio close is local" 'local record' "$("$ACP_BIN" session close local "$SID" 2>&1)"
 check "stdio rename is local" 'local record' "$("$ACP_BIN" session rename local "$SID" "renamed locally" 2>&1)"
 check "stdio rename sticks locally" 'renamed locally' "$("$ACP_BIN" session ls local 2>&1)"
@@ -88,11 +93,33 @@ check "bad token rejected" '401'          "$("$ACP_BIN" status badtok 2>&1)"
 check "status"             'identity   box-b' "$("$ACP_BIN" status reviewer 2>&1)"
 WSID=$(new_session reviewer)
 check "send --new creates a session over ws" 'sess_' "$WSID"
-check "ws turn 2"          'you said "alpha"' "$("$ACP_BIN" send reviewer "$WSID" --quiet alpha 2>&1)"
-check "ws turn 3 is live"  'you said "beta"'  "$("$ACP_BIN" send reviewer --quiet beta 2>&1)"
+check "ws turn 2"          'you said "alpha"' "$("$ACP_BIN" send "$WSID@reviewer" --quiet alpha 2>&1)"
+check "ws turn 3 is live"  'you said "beta"'  "$("$ACP_BIN" send "$WSID@reviewer" --quiet beta 2>&1)"
 check "session ls --remote" "$WSID"       "$("$ACP_BIN" session ls reviewer --remote 2>&1)"
 check "session ls is live"  "$WSID"       "$("$ACP_BIN" session ls reviewer 2>&1)"
 check "agent ls counts live" ' 1'         "$("$ACP_BIN" agent ls 2>&1 | grep reviewer)"
+
+echo "== addresses =="
+ADDR_A=$(new_session reviewer --title addr-dup)
+ADDR_B=$(new_session reviewer --title addr-dup)
+check "unknown agent in an address" 'unknown agent' \
+  "$("$ACP_BIN" send sess_x@ghost hi 2>&1)"
+check "ambiguous bare title errors instead of guessing" 'matches more than one session' \
+  "$("$ACP_BIN" send addr-dup --quiet hi 2>&1)"
+check "bare id still resolves (unambiguous)" 'you said "by id"' \
+  "$("$ACP_BIN" send "$ADDR_A" --quiet "by id" 2>&1)"
+check "new@ as --from is rejected" 'only makes sense as the' \
+  "$("$ACP_BIN" send --from new@reviewer "$ADDR_A@reviewer" --quiet nope 2>&1)"
+"$ACP_BIN" send "$ADDR_A@reviewer" --oneway "fire and forget" >/dev/null 2>&1
+sleep 0.5
+check "oneway delivers without waiting for a reply" 'fire and forget' \
+  "$("$ACP_BIN" session log reviewer "$ADDR_A" --tail 6 2>&1)"
+check "--from headers reach the peer, not just the local transcript" "From: $ADDR_A@reviewer" \
+  "$("$ACP_BIN" send --from "$ADDR_A@reviewer" "$ADDR_B@reviewer" --quiet relayed 2>&1)"
+check "--from is recorded on the transcript" "\"from\":\"$ADDR_A@reviewer\"" \
+  "$("$ACP_BIN" session log reviewer "$ADDR_B" --json --tail 6 2>&1)"
+check "first-turn title is the clean message, not the headers" 'addr-dup' \
+  "$("$ACP_BIN" session ls reviewer --remote 2>&1 | grep "$ADDR_B")"
 
 echo "== naming =="
 NAMED=$(new_session reviewer)
@@ -110,15 +137,15 @@ new_session reviewer --title "call it bob" >/dev/null
 check "explicit title at creation" 'call it bob' "$("$ACP_BIN" session ls reviewer --remote 2>&1)"
 check "rename by id"    'renamed for real' "$("$ACP_BIN" session rename reviewer "$NAMED" "renamed for real" 2>&1)"
 check "rename sticks"   'renamed for real' "$("$ACP_BIN" session ls reviewer --remote 2>&1 | grep "$NAMED")"
-check "a real message does not undo a rename" 'renamed for real'   "$("$ACP_BIN" send reviewer "$NAMED" --quiet "does this rename the session" >/dev/null 2>&1; "$ACP_BIN" session ls reviewer --remote 2>&1 | grep "$NAMED")"
+check "a real message does not undo a rename" 'renamed for real'   "$("$ACP_BIN" send "$NAMED@reviewer" --quiet "does this rename the session" >/dev/null 2>&1; "$ACP_BIN" session ls reviewer --remote 2>&1 | grep "$NAMED")"
 check "rename with no id renames latest" 'latest one' "$("$ACP_BIN" session rename reviewer "latest one" 2>&1)"
-check "permission policy"  '"optionId":"yes"' "$("$ACP_BIN" send reviewer --quiet "permission check" 2>&1)"
-check "daemon-side fs"     'content of repo' "$("$ACP_BIN" send reviewer --quiet "read $WORK/repo/note.txt" 2>&1)"
+check "permission policy"  '"optionId":"yes"' "$("$ACP_BIN" send "$NAMED@reviewer" --quiet "permission check" 2>&1)"
+check "daemon-side fs"     'content of repo' "$("$ACP_BIN" send "$NAMED@reviewer" --quiet "read $WORK/repo/note.txt" 2>&1)"
 
 echo "== daemon restart recovery =="
 check "rename before restart" 'renamed one' "$("$ACP_BIN" session rename reviewer "$WSID" "renamed one" 2>&1)"
 kill "${PIDS[-1]}" 2>/dev/null; sleep 0.6
-check "peer down error" 'Start the daemon' "$("$ACP_BIN" send reviewer "$WSID" hi 2>&1)"
+check "peer down error" 'Start the daemon' "$("$ACP_BIN" send "$WSID@reviewer" hi 2>&1)"
 # Silence is not proof of death: a daemon we cannot reach keeps its records.
 check "unreachable keeps record"   "$WSID"            "$("$ACP_BIN" session ls reviewer 2>&1)"
 check "unreachable prunes nothing" 'nothing to prune' "$("$ACP_BIN" session prune reviewer 2>&1)"
@@ -137,9 +164,12 @@ check "prune drops the dead"   "$WSID"           "$("$ACP_BIN" session prune rev
 check "pruned for good" 'no sessions for'        "$("$ACP_BIN" session ls reviewer --all 2>&1)"
 check "transcript outlives it" '>>'              "$("$ACP_BIN" session log reviewer "$WSID" --tail 4 2>&1)"
 # A pruned record is not a lost session: the daemon reloads it from the id.
-check "session reloaded" 'you said "after restart"' "$("$ACP_BIN" send reviewer "$WSID" --quiet "after restart" 2>&1)"
+check "session reloaded" 'you said "after restart"' "$("$ACP_BIN" send "$WSID@reviewer" --quiet "after restart" 2>&1)"
 check "reload relists it live" "$WSID"           "$("$ACP_BIN" session ls reviewer 2>&1)"
-check "send with no id reuses it" 'you said "again"' "$("$ACP_BIN" send reviewer --quiet again 2>&1)"
+# No implicit "latest session" anymore -- an address is required -- but a bare
+# title still resolves to one, unambiguously, since it's the only session
+# titled "renamed one" right now.
+check "send by title resolves it" 'you said "again"' "$("$ACP_BIN" send "renamed one" --quiet again 2>&1)"
 
 # The reload above went through a fresh in-memory entry with no title -- if the daemon didn't
 # recover it from the transcript first, the "again" prompt just sent would have named it instead.
@@ -155,7 +185,7 @@ daemon_cfg "$WORK/home_b" box-b "$PORT_B" tokenB "{\"ACP_HOME\":\"$WORK/home_age
 ACP_HOME="$WORK/home_b" "$ACP_BIN" serve -v > "$WORK/b3.log" 2>&1 & PIDS+=($!)
 wait_up "$WORK/b3.log" || exit 1
 check "peer consults peer" 'peer-c replied' \
-  "$(ACP_HOME="$WORK/home_cli" "$ACP_BIN" send reviewer --new --quiet "relay peer-c what is here" 2>&1)"
+  "$(ACP_HOME="$WORK/home_cli" "$ACP_BIN" send new@reviewer --quiet "relay peer-c what is here" 2>&1)"
 check "second hop ran in its own repo" 'repo2' \
   "$(ACP_HOME="$WORK/home_cli" "$ACP_BIN" session log reviewer --tail 4 2>&1)"
 
@@ -165,12 +195,12 @@ ALT=$(new_session reviewer)
 check "have a session to close" 'sess_'  "$ALT"
 check "acp session <agent> ls"  'AGENT'  "$("$ACP_BIN" session reviewer ls 2>&1)"
 check "close"                   'closed' "$("$ACP_BIN" session close reviewer "$ALT" 2>&1)"
-check "closed refuses"          'is closed' "$("$ACP_BIN" send reviewer "$ALT" x 2>&1)"
+check "closed refuses"          'is closed' "$("$ACP_BIN" send "$ALT@reviewer" x 2>&1)"
 check "transcript"              '>>'     "$("$ACP_BIN" session log reviewer "$WSID" --tail 4 2>&1)"
 check "prune keeps the live"   'active' "$("$ACP_BIN" session ls reviewer 2>&1)"
 check "nothing left to prune"  'nothing to prune' "$("$ACP_BIN" session prune reviewer 2>&1)"
 check "agent remove"            'removed' "$("$ACP_BIN" agent remove badtok 2>&1)"
-check "unknown agent"           'unknown agent' "$("$ACP_BIN" send ghost hi 2>&1)"
+check "unknown agent"           'unknown agent' "$("$ACP_BIN" send new@ghost hi 2>&1)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

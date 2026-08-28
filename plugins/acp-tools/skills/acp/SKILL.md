@@ -28,46 +28,68 @@ invent a peer name.
 
 ## Delegating a task
 
+### Addresses
+
+Every session has an address: `<session id>@<agent>` (e.g. `sess_1@reviewer`).
+`new@<agent>` isn't a real session -- it means "start one here" -- and only
+makes sense as who you're sending *to*, never as who it's *from*.
+
+**Always pass a full `id@agent` (or `new@agent`) address, for both the
+target and `--from`.** A bare id or title also resolves (the CLI searches
+every known session for it), but that's a convenience for a human typing at
+a terminal, not for you: it can be ambiguous (erroring out if more than one
+session matches), and you already know your own address exactly -- there's
+nothing to search for.
+
+### Sending
+
 `acp send` is the workhorse. It runs one prompt turn and streams the peer's
 progress live:
 
 ```
-acp send reviewer "review the auth changes on branch fix/login"
+acp send new@reviewer "review the auth changes on branch fix/login"
 ```
 
-With no session id it continues the most recent active session with that
-agent, which is what you usually want -- the peer keeps its context, so
-follow-ups are cheap:
+That prints the session's address (`sess_1@reviewer`) alongside the reply --
+keep it, and use it to continue the same conversation:
 
 ```
-acp send reviewer "now check the tests for those files"
-acp send reviewer "summarise what you'd change in three bullets"
+acp send sess_1@reviewer "now check the tests for those files"
+acp send sess_1@reviewer "summarise what you'd change in three bullets"
 ```
+
+**You are relaying a message on someone else's behalf, not sending your own:
+pass `--from <your own session's address>`.** It's recorded on the
+transcript entry so the conversation can be traced back to where it came
+from. A human using `acp` directly at a terminal normally omits `--from`.
 
 Useful flags:
 
 | flag | use |
 |---|---|
+| `--from ADDR` | your own session's address -- see above; mandatory for you, never for a human |
+| `--oneway` | hand the message off and return immediately, without waiting for a reply (needs the peer to be a `ws://` daemon, not `stdio:`) |
 | `--quiet` | print only the reply text -- best when you need to read the answer |
 | `--json` | newline-delimited `session/update` objects, then a final `{sessionId, stopReason, text}` |
-| `--new` | force a fresh session instead of continuing the last one |
 | `--thoughts` | include the peer's reasoning |
 | `--timeout S` | give up after S seconds |
 
 Prefer `--quiet` when you intend to quote or act on the answer, and plain
-`acp send` when the user is watching and wants to see progress.
+`acp send` when the user is watching and wants to see progress. Reach for
+`--oneway` only when you genuinely don't need the reply -- e.g. notifying a
+peer of something -- since without it you'll block until the peer's turn ends.
 
 A message can also arrive on stdin, which avoids quoting problems for long
 prompts:
 
 ```
-git diff | acp send reviewer --quiet "review this diff"
+git diff | acp send sess_1@reviewer --quiet "review this diff"
 ```
 
 ## Sessions
 
 A session is one continuous conversation with a peer. Multi-turn works by
-sending repeatedly to the same session id.
+sending repeatedly to the same address.
 
 ```
 acp session ls                       # every session that is live right now
@@ -83,8 +105,8 @@ acp session log    reviewer <id>     # replay the transcript (--tail N)
 
 `acp session <agent> <verb>` works too (`acp session reviewer close`).
 
-Session ids come from `acp send <agent> --new` (see Talking below) or `acp
-session ls` -- never guess one. `acp session ls` asks every reachable peer
+Addresses come from `acp send new@<agent> ...` (see Delegating a task above)
+or `acp session ls` -- never guess one. `acp session ls` asks every reachable peer
 and lists what it is really holding, so a conversation started in the web UI
 shows up and one ended there does not. A record a reachable peer disowns is
 marked `ended` and hidden; `--all` shows it, `prune` deletes it, and the

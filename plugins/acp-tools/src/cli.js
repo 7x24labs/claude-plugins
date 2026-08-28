@@ -10,7 +10,7 @@ const acp = require('./acp');
 
 const VERSION = '1.0.0';
 const VALUE_FLAGS = new Set([
-  'cwd', 'token', 'port', 'host', 'timeout', 'tail', 'agent-command', 'permission', 'fs-scope', 'title',
+  'cwd', 'token', 'port', 'host', 'timeout', 'tail', 'agent-command', 'permission', 'fs-scope', 'title', 'from',
 ]);
 
 // ------------------------------------------------------------------- helpers
@@ -183,6 +183,67 @@ async function pollDaemons(cfg, names, flags) {
 function classifyStale(cfg, s, authority) {
   if (!cfg.agents[s.agent]) return 'orphan';
   return authority.has(s.agent) ? 'ended' : null;
+}
+
+// --------------------------------------------------------------- addresses
+
+// A session's address is "<sessionId>@<agent>" -- the one thing that names a
+// session unambiguously anywhere in the system. "new@<agent>" is not a real
+// session, it means "start one here"; it only makes sense as a *to* address,
+// since there is nothing to send a message *from* that does not exist yet.
+function splitAddress(token) {
+  const at = token.lastIndexOf('@');
+  if (at === -1) return null;
+  return { id: token.slice(0, at), agent: token.slice(at + 1) };
+}
+
+// Looks a bare id or title up across every session anyone knows about --
+// this machine's registry, and whatever every reachable daemon actually
+// holds (a session started from the web UI never touches the registry).
+// Same union `cmdSessionLs` shows, so what matches here is what you'd see
+// there. Errors on more than one match instead of guessing: an AI caller
+// should never hit this path at all (see resolveAddress below), it exists
+// for a human who would rather type a title than an id.
+async function findAddress(cfg, token, flags) {
+  const authority = await pollDaemons(cfg, Object.keys(cfg.agents), flags);
+  const byKey = new Map();
+  for (const s of client.listSessions(cfg))
+    byKey.set(config.sessionKey(s.agent, s.sessionId), s);
+  for (const list of authority.values()) {
+    for (const s of list) {
+      const key = config.sessionKey(s.agent, s.sessionId);
+      byKey.set(key, Object.assign({}, byKey.get(key), s));
+    }
+  }
+
+  const matches = [...byKey.values()].filter((s) => s.sessionId === token || sessionTitle(s) === token);
+  if (!matches.length) die(`no session found matching "${token}" -- use an address (<id>@<agent>) or check \`acp session ls\``);
+  if (matches.length > 1) {
+    die(`"${token}" matches more than one session -- say which:\n` +
+      matches.map((s) => `  ${s.sessionId}@${s.agent}  ${sessionTitle(s) ? `(${sessionTitle(s)})` : ''}`).join('\n'));
+  }
+  return { id: matches[0].sessionId, agent: matches[0].agent };
+}
+
+// Resolves an address argument. "<id>@<agent>" (or "new@<agent>") is taken
+// exactly as given -- no lookup, no ambiguity possible, which is what makes
+// it the only form an AI caller should ever pass (see the SESSIONS section
+// of `acp help` and skills/acp/SKILL.md). Anything without an "@" goes
+// through findAddress -- a convenience for a human typing an id or title.
+async function resolveAddress(cfg, token, flags, { allowNew = false } = {}) {
+  if (!token) return null;
+  const addr = splitAddress(token) || await findAddress(cfg, token, flags);
+
+  if (!cfg.agents[addr.agent]) {
+    const known = Object.keys(cfg.agents);
+    die(`unknown agent: ${addr.agent}` +
+      (known.length ? ` -- registered: ${known.join(', ')}` : ' -- none registered yet, use `acp agent add`'));
+  }
+  if (addr.id === 'new') {
+    if (!allowNew) die(`"new@${addr.agent}" only makes sense as the message's recipient, not its sender`);
+    return { agent: addr.agent, sessionId: null, isNew: true };
+  }
+  return { agent: addr.agent, sessionId: addr.id, isNew: false };
 }
 
 async function cmdSessionLs(cfg, rest, flags) {
@@ -386,8 +447,24 @@ function cmdSessionLog(cfg, rest, flags) {
 
 // --------------------------------------------------------------------- send
 
-// Runs one prompt turn. Returns { stopReason, text }.
-async function runTurn(conn, sessionId, text, flags) {
+// ACP delivers a prompt as plain text -- the peer has no view into `--from`,
+// it is local-only bookkeeping (see runTurn's transcript entry below). A
+// peer that only gets the message body has no address to reply to, which
+// defeats the point of `--from` for anything but a one-off note: prepend
+// email-style headers when there is a sender to name, so the reply -- an
+// ordinary `acp send <from> ...` the peer runs on its own, ACP has no
+// protocol-level reply routing -- has somewhere to go.
+function addressedMessage(text, fromAddr, toAddr) {
+  return fromAddr ? `From: ${fromAddr}\nTo: ${toAddr}\n\n${text}` : text;
+}
+
+// Runs one prompt turn. Returns { stopReason, text }. `from`, if given, is
+// the sender's own resolved address ("<id>@<agent>") -- recorded on the
+// transcript entry so a relayed conversation can be traced back to whoever
+// sent it, same as the web UI would show it. `titleText` -- the message
+// before addressedMessage() headers were added, if any -- is what a first
+// turn names the session from; falls back to `text` itself when not given.
+async function runTurn(conn, sessionId, text, flags, from, titleText = text) {
   const json = Boolean(flags.json);
   const quiet = Boolean(flags.quiet);
   const renderer = (json || quiet) ? null : acp.createRenderer({
@@ -403,7 +480,7 @@ async function runTurn(conn, sessionId, text, flags) {
     if (renderer) renderer.write(u);
   };
 
-  config.appendTranscript(conn.name, sessionId, { type: 'prompt', text });
+  config.appendTranscript(conn.name, sessionId, Object.assign({ type: 'prompt', text }, from ? { from } : {}));
 
   // The opening prompt names the conversation, the way the web UI titles it.
   // Recorded before the turn runs so a session that errors out is still
@@ -411,7 +488,7 @@ async function runTurn(conn, sessionId, text, flags) {
   const titled = client.listSessions(config.load(), conn.name)
     .find((s) => s.sessionId === sessionId);
   if (!titled || !titled.title)
-    client.rememberSession(conn.name, sessionId, { title: config.titleFrom(text) });
+    client.rememberSession(conn.name, sessionId, { title: config.titleFrom(titleText) });
 
   const timeoutMs = flags.timeout ? Number(flags.timeout) * 1000 : 0;
   let res;
@@ -443,65 +520,76 @@ async function runTurn(conn, sessionId, text, flags) {
 }
 
 async function cmdSend(cfg, rest, flags) {
-  const agent = rest[0];
-  if (!agent) die('usage: acp send <agent> [session] <message...>');
+  const toToken = rest[0];
+  if (!toToken) die('usage: acp send [--from ADDR] [--oneway] <to_session_address> <message...>');
 
-  let words = rest.slice(1);
-  // `acp send <agent> [session] <message...>`: the first word is a session id
-  // only if some session actually goes by it. The registry answers for the
-  // ones this machine started; the daemon is asked below for the rest.
-  const maybeId = words.length > 1 ? words[0] : null;
-  // A transcript counts as much as a record: it is what survives `session
-  // prune`, and it is proof this id named a real conversation.
-  let sessionId = maybeId && (client.isKnownSession(cfg, agent, maybeId)
-    || fs.existsSync(config.transcriptPath(agent, maybeId, false))) ? maybeId : null;
-  if (sessionId) words = words.slice(1);
-  let message = words.join(' ').trim();
-  if (!message && !process.stdin.isTTY) {
-    message = fs.readFileSync(0, 'utf8').trim();
-  }
+  let message = rest.slice(1).join(' ').trim();
+  if (!message && !process.stdin.isTTY) message = fs.readFileSync(0, 'utf8').trim();
   if (!message) die('nothing to send -- pass a message, or pipe one on stdin');
 
-  const conn = await client.connectAgent(cfg, agent, {
+  // `to` may be "new@<agent>" (start a session) or an existing address; `from`
+  // -- the sender's own address, mandatory for an AI caller relaying a
+  // message, never required of a human -- is never "new@": there is nothing
+  // to send *from* that does not exist yet.
+  const to = await resolveAddress(cfg, toToken, flags, { allowNew: true });
+  const from = flags.from ? await resolveAddress(cfg, flags.from, flags) : null;
+
+  if (flags.oneway && (cfg.agents[to.agent].url || '').startsWith('stdio:'))
+    die(`--oneway needs a daemon to keep the turn running after this process exits -- ` +
+        `"${to.agent}" is a stdio: agent (a process per command, gone the moment this returns). ` +
+        `Put it behind \`acp serve\`, or drop --oneway and wait for the reply.`);
+
+  const conn = await client.connectAgent(cfg, to.agent, {
     verbose: flags.verbose,
     onUpdate: (p) => { if (conn && conn.onUpdate) conn.onUpdate(p); },
   });
   try {
-    // Still unclaimed: a session started from the web UI, or one whose record
-    // was pruned, is live with nothing about it on this machine. Ask the
-    // daemon before sending its id off as the first word of the message.
-    if (!sessionId && maybeId && !flags.new
-        && await client.daemonHasSession(conn, maybeId)) {
-      sessionId = maybeId;
-      message = words.slice(1).join(' ').trim();
-    }
-    if (!sessionId && !flags.new) {
-      const latest = client.latestUsable(cfg, agent);
-      if (latest) sessionId = latest.sessionId;
-    }
-    if (!sessionId) {
+    let sessionId = to.sessionId;
+    if (to.isNew) {
       const res = await client.newSession(conn, flags.cwd, flags.title);
       sessionId = res.sessionId;
-      if (!flags.json && isTTY()) process.stderr.write(`(new session ${sessionId})\n`);
+      if (!flags.json && isTTY()) process.stderr.write(`(new session ${sessionId}@${to.agent})\n`);
     }
 
-    const record = cfg.sessions[config.sessionKey(agent, sessionId)] || {};
+    const record = cfg.sessions[config.sessionKey(to.agent, sessionId)] || {};
     await client.ensureLive(conn, sessionId, record.cwd || flags.cwd);
+
+    const address = `${sessionId}@${to.agent}`;
+    const fromAddr = from ? `${from.sessionId}@${from.agent}` : null;
+    const wire = addressedMessage(message, fromAddr, address);
+
+    if (flags.oneway) {
+      // Fire and forget: hand the prompt to the daemon and return without
+      // waiting on session/prompt's response. The write itself is synchronous
+      // (see jsonrpc.js#request -> _write), so the message is genuinely on
+      // its way before conn.close() below runs -- only the reply is skipped.
+      // That close() always rejects this same request's promise with "local
+      // close" once it lands (see jsonrpc.js#_shutdown) -- that is us hanging
+      // up on purpose, not a real failure, so it is not worth recording.
+      config.appendTranscript(to.agent, sessionId,
+        Object.assign({ type: 'prompt', text: wire }, fromAddr ? { from: fromAddr } : {}));
+      const titled = client.listSessions(config.load(), to.agent).find((s) => s.sessionId === sessionId);
+      if (!titled || !titled.title) client.rememberSession(to.agent, sessionId, { title: config.titleFrom(message) });
+      conn.peer.request('session/prompt', { sessionId, prompt: acp.textPrompt(wire) }, { timeoutMs: 0 }).catch(() => {});
+      if (flags.json) jsonOut({ sessionId: address, sent: true });
+      else if (isTTY()) process.stderr.write(`sent to ${address}\n`);
+      return;
+    }
 
     let result;
     try {
-      result = await runTurn(conn, sessionId, message, flags);
+      result = await runTurn(conn, sessionId, wire, flags, fromAddr, message);
     } catch (err) {
       // A daemon that restarted has forgotten the session; ask it to reload.
       if (!/unknown session/i.test(err.message || '')) throw err;
       await conn.peer.request('acp/resume',
         { sessionId, cwd: record.cwd || conn.agentCfg.cwd }, { timeoutMs: 180000 });
-      result = await runTurn(conn, sessionId, message, flags);
+      result = await runTurn(conn, sessionId, wire, flags, fromAddr, message);
     }
     const { stopReason, text } = result;
     if (flags.quiet) out(text.trim());
-    if (flags.json) jsonOut({ sessionId, stopReason, text });
-    else if (isTTY()) process.stderr.write(`\n[${stopReason}] session ${sessionId}\n`);
+    if (flags.json) jsonOut({ sessionId: address, stopReason, text });
+    else if (isTTY()) process.stderr.write(`\n[${stopReason}] session ${address}\n`);
     if (stopReason === 'refusal') process.exitCode = 2;
   } finally { conn.close(); }
 }
@@ -509,21 +597,21 @@ async function cmdSend(cfg, rest, flags) {
 // --------------------------------------------------------------------- chat
 
 async function cmdChat(cfg, rest, flags) {
-  const agent = rest[0];
-  if (!agent) die('usage: acp chat <agent> [session]');
-  const conn = await client.connectAgent(cfg, agent, {
+  const toToken = rest[0];
+  if (!toToken) die('usage: acp chat [--from ADDR] <to_session_address>');
+  const to = await resolveAddress(cfg, toToken, flags, { allowNew: true });
+  const from = flags.from ? await resolveAddress(cfg, flags.from, flags) : null;
+
+  const conn = await client.connectAgent(cfg, to.agent, {
     verbose: flags.verbose,
     onUpdate: (p) => { if (conn && conn.onUpdate) conn.onUpdate(p); },
   });
   try {
-    let sessionId = rest[1];
-    if (!sessionId) {
-      const latest = flags.new ? null : client.latestUsable(cfg, agent);
-      sessionId = latest ? latest.sessionId : (await client.newSession(conn, flags.cwd)).sessionId;
-    }
+    let sessionId = to.isNew ? (await client.newSession(conn, flags.cwd)).sessionId : to.sessionId;
     await client.ensureLive(conn, sessionId,
-      (cfg.sessions[config.sessionKey(agent, sessionId)] || {}).cwd);
-    out(`chatting with "${agent}" -- session ${sessionId}`);
+      (cfg.sessions[config.sessionKey(to.agent, sessionId)] || {}).cwd);
+    out(`chatting with "${to.agent}" -- session ${sessionId}@${to.agent}` +
+        (from ? ` (as ${from.sessionId}@${from.agent})` : ''));
     out('type a message, or /exit to leave, /new for a fresh session\n');
 
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -534,11 +622,13 @@ async function cmdChat(cfg, rest, flags) {
       if (line === '/exit' || line === '/quit') break;
       if (line === '/new') {
         sessionId = (await client.newSession(conn, flags.cwd)).sessionId;
-        out(`new session ${sessionId}\n`);
+        out(`new session ${sessionId}@${to.agent}\n`);
         continue;
       }
       try {
-        const { stopReason } = await runTurn(conn, sessionId, line, flags);
+        const fromAddr = from ? `${from.sessionId}@${from.agent}` : null;
+        const wire = addressedMessage(line, fromAddr, `${sessionId}@${to.agent}`);
+        const { stopReason } = await runTurn(conn, sessionId, wire, flags, fromAddr, line);
         if (stopReason !== 'end_turn') out(`[${stopReason}]`);
       } catch (err) {
         out(`error: ${err.message}`);
@@ -653,15 +743,28 @@ SESSIONS
 
   \`acp session <agent> <verb>\` also works, e.g. acp session reviewer close
 
+ADDRESSES
+  Every session has an address: <session id>@<agent> -- e.g. sess_1@reviewer.
+  new@<agent> means "start a session here" (a *to* address only -- there is
+  nothing to send *from* that doesn't exist yet). Anywhere an address is
+  taken, a bare id or title works too: it is looked up across every known
+  session and resolved for you, erroring if more than one matches. An id@agent
+  or new@agent needs no lookup and cannot be ambiguous -- the only form an AI
+  caller relaying a message should ever pass.
+
 TALKING
-  acp send <agent> [session] <message>   one turn; streams progress live
-        --new       force a fresh session
-        --title "..."  name a session started by this call
-        --quiet     print only the reply text
-        --json      newline-delimited updates, then a final result object
-        --thoughts  include the agent's reasoning
-        --timeout S give up after S seconds
-  acp chat <agent> [session]             interactive multi-turn session
+  acp send [--from ADDR] [--oneway] <to_address> <message>
+        --from ADDR    sender's own address -- omit as a human; an AI
+                       relaying a message must always give one
+        --oneway       hand it off and return -- do not wait for a reply
+                       (needs a ws:// daemon; not for a stdio: agent)
+        --title "..."  name a session started by this call (i.e. new@<agent>)
+        --quiet        print only the reply text
+        --json         newline-delimited updates, then a final result object
+        --thoughts     include the agent's reasoning
+        --timeout S    give up after S seconds
+  acp chat [--from ADDR] <to_address>    interactive multi-turn session
+        (same --quiet/--json/--thoughts/--timeout, applied per turn)
 
 Config: ${config.CONFIG_PATH}`);
 }
