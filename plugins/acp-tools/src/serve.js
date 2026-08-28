@@ -156,7 +156,13 @@ class Daemon {
     sock.on('close', () => { for (const h of handlers.close) h('socket closed'); });
 
     const channel = {
-      send: (line) => sock.send(line),
+      // A client that has already disconnected (Ctrl-C mid-turn, a dropped
+      // connection, a pipe closed early) still has queued dispatches in
+      // flight -- sock.send() throws once the socket is closed, and an
+      // unhandled throw here would take down the whole daemon, every other
+      // client's session included. Nobody is listening for this write
+      // either way, so drop it.
+      send: (line) => { try { sock.send(line); } catch (err) { this.vlog(`send to disconnected client dropped: ${err.message}`); } },
       onMessage: (cb) => handlers.message.push(cb),
       onClose: (cb) => handlers.close.push(cb),
       close: () => sock.close(1000, 'daemon closing'),
@@ -184,6 +190,10 @@ class Daemon {
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: true, audio: false, embeddedContext: true },
+        // We answer all three below, so say so: a client that gates on these --
+        // acp-ui checks before offering to delete a conversation -- would
+        // otherwise treat a session as undeletable and only hide its own copy.
+        sessionCapabilities: { list: {}, delete: {}, close: {} },
       },
       authMethods: [],
     }));
@@ -199,13 +209,87 @@ class Daemon {
 
       const sessionId = res && res.sessionId;
       if (!sessionId) throw new RpcError(ERR.INTERNAL, 'agent returned no sessionId');
+      // A title given at creation -- CLI's `session new --title`, or the UI's "New
+      // conversation" -- goes under `_meta` (ACP's own extension point) so a real
+      // agent that doesn't know the convention just ignores it. With none given the
+      // caller is expected to have already computed the `<agent>-<timestamp>`
+      // default; nothing defaulted here, so a title that never arrives just means
+      // the first prompt still names it, same as before this existed.
+      const title = (p._meta && p._meta.title) || '';
       this.sessions.set(sessionId, {
         sessionId, cwd: path.resolve(cwd), state: 'active',
-        createdAt: now(), updatedAt: now(), turns: 0,
+        createdAt: now(), updatedAt: now(), turns: 0, title,
         extraDirs: p.additionalDirectories || [], owners: new Set([peer]),
       });
+      if (title) this.record(sessionId, { type: 'title', title });
       this.log(`session ${sessionId} created in ${cwd}`);
       return res;
+    });
+
+    // Renames a session's ACP UI/CLI-visible title -- our own convention, not
+    // part of the ACP spec (which has no client-writable session name), so this
+    // is a custom method only our own daemon and CLI/UI understand. Recorded to
+    // the transcript so it survives a daemon restart (config.titleFromTranscript
+    // reads it back); see the `type: 'title'` handling there.
+    peer.handle('session/set_title', async (p) => {
+      const s = this.mustSession(p.sessionId);
+      const title = config.titleFrom(p.title);
+      if (!title) throw new RpcError(ERR.INVALID_PARAMS, 'title must not be empty');
+      s.title = title;
+      s.updatedAt = now();
+      this.record(p.sessionId, { type: 'title', title });
+      this.log(`session ${p.sessionId} renamed to "${title}"`);
+      return { title };
+    });
+
+    // The ACP counterpart to acp/resume: a client that reconnects (the web UI
+    // reloading a session URL) reattaches to an existing session by id. We
+    // advertise loadSession above, so this has to exist -- without it such a
+    // client gets "method not found" and cannot reopen any session.
+    peer.handle('session/load', async (p) => {
+      const s = this.sessions.get(p.sessionId);
+      const cwd = (s && s.cwd) || p.cwd;
+      if (!cwd) {
+        throw new RpcError(ERR.INVALID_PARAMS,
+          `unknown session ${p.sessionId} -- pass cwd so it can be reloaded`);
+      }
+      const entry = await this.agentFor(cwd);
+
+      const caps = (entry.info && entry.info.agentCapabilities) || {};
+      if (!caps.loadSession) {
+        throw new RpcError(ERR.INTERNAL,
+          `agent cannot reload sessions (loadSession not supported); start a new one`);
+      }
+
+      // The agent replays the transcript as session/update notifications while
+      // this is in flight; fanout() already forwards those to the owners, so
+      // add ourselves before asking.
+      if (s) s.owners.add(peer);
+      const res = await entry.peer.request('session/load', {
+        sessionId: p.sessionId,
+        cwd: path.resolve(cwd),
+        mcpServers: p.mcpServers || [],
+        additionalDirectories: p.additionalDirectories,
+      }, { timeoutMs: 120000 });
+
+      if (s) {
+        s.state = 'active';
+        s.updatedAt = now();
+      } else {
+        // A fresh entry after a daemon restart has no title in memory. Recover
+        // it from the transcript now, before the next `session/prompt` gets a
+        // chance to name it from whatever the caller happens to say next --
+        // titleFromTranscript already prefers a rename over the first prompt,
+        // but only once, right here, is that preference actually kept.
+        this.sessions.set(p.sessionId, {
+          sessionId: p.sessionId, cwd: path.resolve(cwd), state: 'active',
+          createdAt: now(), updatedAt: now(), turns: 0,
+          title: config.titleFromTranscript('_daemon', p.sessionId) || '',
+          extraDirs: p.additionalDirectories || [], owners: new Set([peer]),
+        });
+      }
+      this.log(`session ${p.sessionId} loaded from ${cwd}`);
+      return res || {};
     });
 
     peer.handle('session/prompt', async (p) => {
@@ -222,7 +306,10 @@ class Daemon {
       s.state = 'active';
       s.turns += 1;
       s.updatedAt = now();
-      this.record(p.sessionId, { type: 'prompt', prompt: acp.contentToText(p.prompt) });
+      const text = acp.contentToText(p.prompt);
+      // First prompt names the conversation; later turns leave the name alone.
+      if (!s.title) s.title = config.titleFrom(text);
+      this.record(p.sessionId, { type: 'prompt', prompt: text });
 
       // A prompt turn can run for a long time; no client-side timeout.
       const res = await entry.peer.request('session/prompt',
@@ -274,8 +361,13 @@ class Daemon {
         this.log(`session ${p.sessionId} reloaded from ${cwd}`);
       }
       if (!s) {
+        // A fresh entry after a daemon restart has no title in memory -- recover
+        // it from the transcript now (it already prefers a rename over the first
+        // prompt), before the prompt this call is about to make gets the chance
+        // to name the session from whatever the caller happens to say next.
         s = { sessionId: p.sessionId, cwd: path.resolve(cwd), createdAt: now(),
-              turns: 0, extraDirs: [], owners: new Set() };
+              turns: 0, title: config.titleFromTranscript('_daemon', p.sessionId) || '',
+              extraDirs: [], owners: new Set() };
         this.sessions.set(p.sessionId, s);
       }
       s.owners.add(peer);
@@ -302,6 +394,9 @@ class Daemon {
         .map((s) => ({
           sessionId: s.sessionId, cwd: s.cwd, state: s.state,
           createdAt: s.createdAt, updatedAt: s.updatedAt, turns: s.turns,
+          // A session reloaded after a daemon restart has no title in memory;
+          // its transcript still opens with the prompt that named it.
+          title: s.title || config.titleFromTranscript('_daemon', s.sessionId) || '',
         }));
       return { sessions, nextCursor: null };
     });

@@ -11,6 +11,11 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
+// The RFC 6455 handshake GUID -- fixed by the spec, not ours to change. Getting
+// this wrong doesn't break talking to another copy of this same file (both
+// sides would agree on whatever wrong value), but it breaks the handshake
+// against any standards-compliant client -- a browser's native WebSocket
+// (acp-ui) included.
 const GUID = '258EAFA5-E914-47DA-95CA-5AB0DC85B39F';
 const MAX_MESSAGE = 64 * 1024 * 1024;
 

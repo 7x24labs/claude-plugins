@@ -84,6 +84,18 @@ function forgetSession(agent, sessionId) {
   config.update((cfg) => { delete cfg.sessions[config.sessionKey(agent, sessionId)]; });
 }
 
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// `<agent>-<yyyy.MM.dd HH:mm:ss>`, local time -- what a session is called when nobody names it.
+// Matches the UI's own default (see acp-ui's helpers/sessionTitle.ts) so a conversation started
+// from either side reads the same way in `acp session ls` and the Sidebar.
+function defaultTitle(agent) {
+  const d = new Date();
+  const date = `${d.getFullYear()}.${pad2(d.getMonth() + 1)}.${pad2(d.getDate())}`;
+  const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  return `${agent}-${date} ${time}`;
+}
+
 function listSessions(cfg, agent) {
   return Object.values(cfg.sessions)
     .filter((s) => !agent || s.agent === agent)
@@ -97,6 +109,20 @@ function latestUsable(cfg, agent) {
 
 function isKnownSession(cfg, agent, id) {
   return Boolean(cfg.sessions[config.sessionKey(agent, id)]);
+}
+
+// Whether the daemon on the far side is holding that session right now. The
+// registry is only half of what exists -- a session started from the web UI
+// never touches it -- so this is how the other half gets recognised. Best
+// effort: a stdio agent has no daemon, and a refusal simply means "no".
+async function daemonHasSession(conn, sessionId) {
+  if (conn.channel.kind !== 'ws') return false;
+  try {
+    const res = await conn.peer.request('session/list', {}, { timeoutMs: 5000 });
+    return ((res && res.sessions) || []).some((s) => s.sessionId === sessionId);
+  } catch {
+    return false;
+  }
 }
 
 // A `stdio:` agent is a fresh process per CLI invocation, so a session made by
@@ -120,18 +146,42 @@ async function ensureLive(conn, sessionId, cwd) {
   }, { timeoutMs: 180000 });
 }
 
-async function newSession(conn, cwd) {
+// A session always gets a name at creation -- `title` if given, else the
+// `<agent>-<timestamp>` default -- rather than waiting on the first prompt to
+// name it. It goes to the agent as `_meta.title` (ACP's own extension point,
+// so a real agent that has never heard of the convention just ignores it);
+// our own daemon (serve.js) picks it up and holds onto it, so a rename is the
+// only thing that ever changes it after this.
+async function newSession(conn, cwd, title) {
   const dir = path.resolve(cwd || conn.agentCfg.cwd || process.cwd());
+  const name = config.titleFrom(title) || defaultTitle(conn.name);
   const res = await conn.peer.request('session/new',
-    { cwd: dir, mcpServers: [] }, { timeoutMs: 180000 });
+    { cwd: dir, mcpServers: [], _meta: { title: name } }, { timeoutMs: 180000 });
   if (!res || !res.sessionId) throw new Error(`${conn.name}: agent returned no sessionId`);
-  rememberSession(conn.name, res.sessionId, { cwd: dir, state: 'active' });
+  rememberSession(conn.name, res.sessionId, { cwd: dir, state: 'active', title: name });
   if (!conn._loaded) conn._loaded = new Set();
   conn._loaded.add(res.sessionId);   // freshly created: already live
   return res;
 }
 
+// Renames a session -- our own convention layered on top of ACP, which has no
+// client-writable session name (see serve.js#session/set_title). A `ws://`
+// agent is always our own daemon, so the request is always understood; a
+// `stdio:` agent is a bare process with no daemon behind it, so the rename can
+// only ever be local bookkeeping, same as any other session state on that
+// transport (see cmdSessionClose in cli.js).
+async function renameSession(cfg, conn, agent, sessionId, title) {
+  const name = config.titleFrom(title);
+  if (!name) throw new Error('title must not be empty');
+  const isStdio = (cfg.agents[agent].url || '').startsWith('stdio:');
+  if (!isStdio) {
+    await conn.peer.request('session/set_title', { sessionId, title: name }, { timeoutMs: 15000 });
+  }
+  rememberSession(agent, sessionId, { title: name });
+  return { title: name, local: isStdio };
+}
+
 module.exports = {
   lookupAgent, connectAgent, rememberSession, forgetSession,
-  listSessions, latestUsable, isKnownSession, newSession, ensureLive,
+  listSessions, latestUsable, isKnownSession, daemonHasSession, newSession, renameSession, ensureLive,
 };

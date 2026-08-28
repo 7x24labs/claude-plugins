@@ -96,12 +96,11 @@ acp agent add <name> <url> [cwd]       register a peer (--token, --force)
 acp agent remove <name>                unregister (alias: rm)
 acp agent ls [--json]
 
-acp session ls [agent] [--remote]      local registry, or the peer's live view
-acp session new <agent> [--cwd DIR]
-acp session pause  <agent> [session]   cancel the running turn, refuse new ones
-acp session resume <agent> [session]   allow prompts again
+acp session ls [agent] [--all]         what is live now (--all: ended too,
+      [--local] [--remote]             --local: registry only, --remote: one peer)
+acp session rename <agent> [s] <title> rename a session
 acp session close  <agent> [session]
-acp session rm     <agent> [session]
+acp session prune  [agent]             drop records the peers no longer hold
 acp session log    <agent> [session]   replay transcript (--tail N)
 
 acp send <agent> [session] <message>   one turn, streamed
@@ -110,6 +109,23 @@ acp chat <agent> [session]             interactive multi-turn
 ```
 
 `acp session <agent> <verb>` is accepted as well as `acp session <verb> <agent>`.
+
+`session ls` asks every reachable daemon and shows what it is actually holding,
+so a conversation started in the web UI appears and one closed there disappears.
+A local record the daemon disowns is marked `ended` and kept out of the default
+view; `--all` shows it and `prune` deletes it. A peer that cannot be reached is
+left alone -- silence is not proof of death -- and its count reads `1?` in
+`agent ls`. Transcripts survive a prune, and `acp send <agent> <session> ...`
+still reloads a session by id afterwards.
+
+Every session gets a title the moment it is created -- `send --new --title "..."`
+if given, else `<agent>-<yyyy.MM.dd HH:mm:ss>` -- rather than waiting on the
+first prompt to name it. `session rename` changes it later; both are our own
+convention on top of ACP (which has no client-writable session name), so
+they work over `ws://` (always our own daemon) and are local-only bookkeeping
+over `stdio:` (a bare agent process). Renaming from the CLI, the web UI, or
+another machine's CLI against the same daemon all show up in each other's
+`session ls`.
 
 ## Web UI
 

@@ -70,23 +70,36 @@ A session is one continuous conversation with a peer. Multi-turn works by
 sending repeatedly to the same session id.
 
 ```
-acp session ls                       # every session, from the local registry
+acp session ls                       # every session that is live right now
 acp session ls reviewer              # just this peer's
-acp session ls reviewer --remote     # ask the daemon what is actually live
-acp session new reviewer             # prints the new session id
-acp session pause  reviewer <id>     # cancel the running turn, refuse new ones
-acp session resume reviewer <id>     # allow prompts again
+acp session ls --all                 # plus the records no longer live
+acp session ls --local               # the local registry alone, no peers asked
+acp session ls reviewer --remote     # one daemon's own view, nothing else
+acp session rename reviewer <id> X   # rename it -- id optional, defaults to the latest
 acp session close  reviewer <id>     # end it
-acp session rm     reviewer <id>     # end it and drop the local record
+acp session prune  [reviewer]        # drop records the peers no longer hold
 acp session log    reviewer <id>     # replay the transcript (--tail N)
 ```
 
-`acp session <agent> <verb>` works too (`acp session reviewer new`).
+`acp session <agent> <verb>` works too (`acp session reviewer close`).
 
-Session ids come from `acp session new` or `acp session ls` -- never guess
-one. `acp session ls` reads a local JSON registry, so it answers instantly
-and still works when a peer is down; add `--remote` when you specifically
-need the peer's live view.
+Session ids come from `acp send <agent> --new` (see Talking below) or `acp
+session ls` -- never guess one. `acp session ls` asks every reachable peer
+and lists what it is really holding, so a conversation started in the web UI
+shows up and one ended there does not. A record a reachable peer disowns is
+marked `ended` and hidden; `--all` shows it, `prune` deletes it, and the
+transcript survives either way. A peer that cannot be reached keeps its
+records untouched -- silence is not proof of death -- so the list still means
+something when a peer is down, and `--local` skips the peers entirely when
+you want an instant answer.
+
+Every session is named at creation, not left until the first prompt says
+something -- `--title` if given, else `<agent>-<yyyy.MM.dd HH:mm:ss>`.
+`session rename` changes it later. Both are ours on top of ACP, not part of
+the spec, so they only reach a real agent over `ws://` (always our own
+daemon); over `stdio:` (a bare process) they are local bookkeeping. A rename
+from any client -- this CLI, the web UI, another machine's CLI against the
+same daemon -- shows up in the others' `session ls`.
 
 ## Registering peers
 

@@ -10,7 +10,7 @@ const acp = require('./acp');
 
 const VERSION = '1.0.0';
 const VALUE_FLAGS = new Set([
-  'cwd', 'token', 'port', 'host', 'timeout', 'tail', 'agent-command', 'permission', 'fs-scope',
+  'cwd', 'token', 'port', 'host', 'timeout', 'tail', 'agent-command', 'permission', 'fs-scope', 'title',
 ]);
 
 // ------------------------------------------------------------------- helpers
@@ -114,7 +114,7 @@ function cmdAgentRemove(cfg, rest) {
   out(`removed agent "${name}" and its session records`);
 }
 
-function cmdAgentLs(cfg, rest, flags) {
+async function cmdAgentLs(cfg, rest, flags) {
   const names = Object.keys(cfg.agents).sort();
   if (flags.json) return jsonOut(cfg.agents);
   if (!names.length) {
@@ -122,30 +122,134 @@ function cmdAgentLs(cfg, rest, flags) {
     out('  acp agent add <name> <ws://host:port | stdio:command> [cwd]');
     return;
   }
+  // ACTIVE counts what the daemons are really holding, sessions started from
+  // the web UI included. An agent that cannot be asked falls back to the
+  // registry, flagged `?` so a guess is never mistaken for a count.
+  const authority = flags.local ? new Map() : await pollDaemons(cfg, names, flags);
   table(names.map((n) => {
     const a = cfg.agents[n];
-    const live = client.listSessions(cfg, n).filter((s) => s.state === 'active').length;
-    return [n, a.url, a.cwd, live || '-'];
+    const live = authority.get(n);
+    if (live) return [n, a.url, a.cwd, live.length || '-'];
+    const known = client.listSessions(cfg, n).filter((s) => s.state === 'active').length;
+    return [n, a.url, a.cwd, known ? `${known}?` : '-'];
   }), ['NAME', 'URL', 'CWD', 'ACTIVE']);
 }
 
 // ------------------------------------------------------------------ session
 
+// Stored title when there is one, else recovered from the transcript so
+// sessions started before titles were recorded -- and those started from the
+// web UI, which never touches this registry -- are still recognizable.
+const sessionTitle = (s) =>
+  s.title
+  || config.titleFromTranscript(s.agent, s.sessionId)
+  || config.titleFromTranscript('_daemon', s.sessionId)   // browser-started
+  || '';
+
+// What a daemon says it is holding right now, shaped like local records: an
+// array when it answered -- and then it is the whole truth, because a session
+// missing from it has been closed or deleted, very likely from the web UI,
+// which talks straight to the daemon and never touches this registry -- or
+// null when there was nobody to ask, leaving the registry as the only source.
+async function liveSessions(cfg, agent, flags) {
+  const url = (cfg.agents[agent] || {}).url || '';
+  // A stdio agent is spawned per command and keeps no state between them, so
+  // there is no daemon to ask -- and asking would spawn a process just to list.
+  if (!/^wss?:/.test(url)) return null;
+  let conn = null;
+  try {
+    conn = await client.connectAgent(cfg, agent, { verbose: flags.verbose, timeoutMs: 3000 });
+    const res = await conn.peer.request('session/list', {}, { timeoutMs: 5000 });
+    return ((res && res.sessions) || []).map((s) => Object.assign({ agent }, s));
+  } catch {
+    return null;   // down, slow, or refusing us: we learned nothing
+  } finally {
+    if (conn) { try { conn.close(); } catch { /* already gone */ } }
+  }
+}
+
+// Ask every daemon in parallel. The result maps agent name -> live sessions,
+// and holds only the agents that answered: the rest have no authority here.
+async function pollDaemons(cfg, names, flags) {
+  const answers = await Promise.all(names.map((n) => liveSessions(cfg, n, flags)));
+  const authority = new Map();
+  names.forEach((n, i) => { if (answers[i]) authority.set(n, answers[i]); });
+  return authority;
+}
+
+// Registry records the daemons have disowned, and records left behind by an
+// agent that is no longer registered. Split out of the listing so the default
+// view shows what is actually running.
+function classifyStale(cfg, s, authority) {
+  if (!cfg.agents[s.agent]) return 'orphan';
+  return authority.has(s.agent) ? 'ended' : null;
+}
+
 async function cmdSessionLs(cfg, rest, flags) {
   const agent = rest[0];
   if (agent && !cfg.agents[agent]) die(`unknown agent: ${agent}`);
 
-  // Without --remote this is answered from the local registry: no network,
-  // and it still works when a daemon is down.
+  // Default view is live: the daemons are asked, and for every daemon that
+  // answers its list wins outright. --local keeps it offline (registry only);
+  // --remote asks one daemon and nothing else; --all also prints the records
+  // that are no longer live, which `acp send` can still reload by id.
   if (!flags.remote) {
-    const rows = client.listSessions(cfg, agent);
+    const names = agent ? [agent] : Object.keys(cfg.agents);
+    const authority = flags.local ? new Map() : await pollDaemons(cfg, names, flags);
+
+    const merged = new Map();
+    for (const list of authority.values()) {
+      for (const s of list) merged.set(config.sessionKey(s.agent, s.sessionId), s);
+    }
+
+    const stale = [];
+    for (const s of client.listSessions(cfg, agent)) {
+      const key = config.sessionKey(s.agent, s.sessionId);
+      const live = merged.get(key);
+      if (!live) {
+        const why = classifyStale(cfg, s, authority);
+        if (why) stale.push(Object.assign({}, s, { state: why }));
+        else merged.set(key, s);   // nobody to ask -- the record is all we have
+        continue;
+      }
+      // Live and recorded: the daemon owns the state, the record owns the rest.
+      const next = Object.assign({}, s, live);
+      next.turns = Math.max(live.turns || 0, s.turns || 0);
+      next.title = live.title || s.title;
+      next.cwd = live.cwd || s.cwd;
+      merged.set(key, next);
+    }
+
+    // Write back what we learned, so the registry stops calling dead sessions
+    // active -- `acp agent ls` counts those, and `acp send` picks the latest.
+    const demoted = stale.filter((s) => s.state === 'ended'
+      && (cfg.sessions[config.sessionKey(s.agent, s.sessionId)] || {}).state !== 'ended');
+    if (demoted.length) {
+      config.update((c) => {
+        for (const s of demoted) {
+          const rec = c.sessions[config.sessionKey(s.agent, s.sessionId)];
+          if (rec) rec.state = 'ended';   // not updatedAt: that is when it last ran
+        }
+      });
+    }
+
+    const rows = (flags.all ? [...merged.values(), ...stale] : [...merged.values()])
+      .map((s) => Object.assign({}, s, { title: sessionTitle(s) }))
+      .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+
     if (flags.json) return jsonOut(rows);
     if (!rows.length) {
       out(agent ? `no sessions for "${agent}"` : 'no sessions');
-      return;
+    } else {
+      table(rows.map((s) => [s.agent, s.sessionId, s.state || '-', s.turns || 0, s.cwd || '-',
+        ago(s.updatedAt), s.title || '-']),
+        ['AGENT', 'SESSION', 'STATE', 'TURNS', 'CWD', 'UPDATED', 'TITLE']);
     }
-    return table(rows.map((s) => [s.agent, s.sessionId, s.state, s.turns || 0, s.cwd || '-', ago(s.updatedAt)]),
-      ['AGENT', 'SESSION', 'STATE', 'TURNS', 'CWD', 'UPDATED']);
+    if (stale.length && !flags.all && isTTY()) {
+      process.stderr.write(`(${stale.length} record(s) no longer live -- ` +
+        `acp session ls --all, or acp session prune)\n`);
+    }
+    return;
   }
 
   if (!agent) die('--remote needs an agent: acp session ls <agent> --remote');
@@ -156,61 +260,103 @@ async function cmdSessionLs(cfg, rest, flags) {
     if (flags.json) return jsonOut(rows);
     if (!rows.length) return out(`no live sessions on "${agent}"`);
     table(rows.map((s) => [s.sessionId, s.state || '-', s.turns === undefined ? '-' : s.turns,
-      s.cwd || '-', ago(s.updatedAt)]), ['SESSION', 'STATE', 'TURNS', 'CWD', 'UPDATED']);
+      s.cwd || '-', ago(s.updatedAt), s.title || '-']),
+      ['SESSION', 'STATE', 'TURNS', 'CWD', 'UPDATED', 'TITLE']);
   } finally { conn.close(); }
 }
 
-async function cmdSessionNew(cfg, rest, flags) {
+// Drop the registry records that can no longer be reached: sessions a daemon
+// we could reach is not holding, and sessions of an unregistered agent. An
+// agent nobody could reach is left alone -- silence is not proof of death.
+async function cmdSessionPrune(cfg, rest, flags) {
   const agent = rest[0];
-  if (!agent) die('usage: acp session new <agent> [--cwd DIR]');
+  if (agent && !cfg.agents[agent]) die(`unknown agent: ${agent}`);
+  const names = agent ? [agent] : Object.keys(cfg.agents);
+  const authority = await pollDaemons(cfg, names, flags);
+
+  const live = new Set();
+  for (const [name, list] of authority) {
+    for (const s of list) live.add(config.sessionKey(name, s.sessionId));
+  }
+
+  const doomed = client.listSessions(cfg, agent)
+    .filter((s) => classifyStale(cfg, s, authority)
+      && !live.has(config.sessionKey(s.agent, s.sessionId)));
+
+  if (doomed.length) {
+    config.update((c) => {
+      for (const s of doomed) delete c.sessions[config.sessionKey(s.agent, s.sessionId)];
+    });
+  }
+  if (flags.json) {
+    return jsonOut(doomed.map((s) => ({ agent: s.agent, sessionId: s.sessionId })));
+  }
+  if (!doomed.length) return out('nothing to prune');
+  for (const s of doomed) out(`${s.agent}  ${s.sessionId}`);
+  out(`pruned ${doomed.length} session record(s); transcripts kept in ${config.LOG_DIR}`);
+}
+
+// `acp session rename <agent> [session] <title...>` -- the middle word is a
+// session id only if some session actually goes by it, same rule `send` uses;
+// otherwise the session defaults to the agent's most recently used one, same
+// as close/pause/resume/rm.
+async function cmdSessionRename(cfg, rest, flags) {
+  const agent = rest[0];
+  if (!agent) die('usage: acp session rename <agent> [session] <title...>');
+  const words = rest.slice(1);
+  if (!words.length) die('usage: acp session rename <agent> [session] <title...>');
+  // The first word is a session id only if a title still remains after it --
+  // `acp session rename reviewer alone` renames the latest session to "alone".
+  const maybeId = words.length > 1 ? words[0] : null;
+  let sessionId = maybeId && (client.isKnownSession(cfg, agent, maybeId)
+    || fs.existsSync(config.transcriptPath(agent, maybeId, false))) ? maybeId : null;
+
   const conn = await client.connectAgent(cfg, agent, { verbose: flags.verbose });
   try {
-    const res = await client.newSession(conn, flags.cwd);
-    if (flags.json) return jsonOut(res);
-    out(res.sessionId);
-    if (isTTY()) {
-      process.stderr.write(`new session on "${agent}" in ${path.resolve(flags.cwd || conn.agentCfg.cwd)}\n`);
-      process.stderr.write(`  acp send ${agent} ${res.sessionId} "your first message"\n`);
+    // Not a known local id -- ask the daemon before assuming it is the start
+    // of the title, the same way `send` recognizes a web-UI session.
+    if (!sessionId && maybeId && await client.daemonHasSession(conn, maybeId))
+      sessionId = maybeId;
+
+    const title = (sessionId ? words.slice(1) : words).join(' ').trim();
+    if (!title) die('usage: acp session rename <agent> [session] <title...>');
+
+    if (!sessionId) {
+      const latest = client.latestUsable(cfg, agent);
+      if (!latest) die(`no known sessions for "${agent}"`);
+      sessionId = latest.sessionId;
     }
+
+    const res = await client.renameSession(cfg, conn, agent, sessionId, title);
+    if (flags.json) return jsonOut(Object.assign({ sessionId }, res));
+    out(`session ${sessionId} on "${agent}" renamed to "${res.title}"` + (res.local ? ' (local record)' : ''));
   } finally { conn.close(); }
 }
 
-// close | pause | resume | rm
-async function cmdSessionState(cfg, action, rest, flags) {
+async function cmdSessionClose(cfg, rest, flags) {
   const agent = rest[0];
   let sessionId = rest[1];
-  if (!agent) die(`usage: acp session ${action} <agent> [session]`);
+  if (!agent) die('usage: acp session close <agent> [session]');
   if (!sessionId) {
     const latest = client.listSessions(cfg, agent)[0];
     if (!latest) die(`no known sessions for "${agent}"`);
     sessionId = latest.sessionId;
   }
 
-  const method = { close: 'session/close', rm: 'session/delete',
-                   pause: 'acp/pause', resume: 'acp/resume' }[action];
-  const record = cfg.sessions[config.sessionKey(agent, sessionId)] || {};
-  const newState = { close: 'closed', pause: 'paused', resume: 'active', rm: null }[action];
-
   // A stdio agent holds no state between commands, so there is nothing to
   // reach: the local record is the whole truth.
   if ((cfg.agents[agent].url || '').startsWith('stdio:')) {
-    if (action === 'rm') client.forgetSession(agent, sessionId);
-    else client.rememberSession(agent, sessionId, { state: newState });
-    if (flags.json) return jsonOut({ sessionId, action, state: newState, local: true });
-    return out(`session ${sessionId} on "${agent}" marked ${newState || 'deleted'} (local record)`);
+    client.rememberSession(agent, sessionId, { state: 'closed' });
+    if (flags.json) return jsonOut({ sessionId, action: 'close', state: 'closed', local: true });
+    return out(`session ${sessionId} on "${agent}" marked closed (local record)`);
   }
   const conn = await client.connectAgent(cfg, agent, { verbose: flags.verbose });
   try {
-    const params = { sessionId };
-    if (action === 'resume') params.cwd = record.cwd || cfg.agents[agent].cwd;
-    const res = await conn.peer.request(method, params, { timeoutMs: 120000 });
+    const res = await conn.peer.request('session/close', { sessionId }, { timeoutMs: 120000 });
+    client.rememberSession(agent, sessionId, { state: 'closed' });
 
-    if (action === 'rm') client.forgetSession(agent, sessionId);
-    else client.rememberSession(agent, sessionId, { state: newState });
-
-    if (flags.json) return jsonOut(Object.assign({ sessionId, action }, res || {}));
-    const verb = { close: 'closed', pause: 'paused', resume: 'resumed', rm: 'deleted' }[action];
-    out(`session ${sessionId} on "${agent}" ${verb}` +
+    if (flags.json) return jsonOut(Object.assign({ sessionId, action: 'close' }, res || {}));
+    out(`session ${sessionId} on "${agent}" closed` +
         (res && res.reloaded ? ' (reloaded from disk)' : ''));
   } finally { conn.close(); }
 }
@@ -259,6 +405,14 @@ async function runTurn(conn, sessionId, text, flags) {
 
   config.appendTranscript(conn.name, sessionId, { type: 'prompt', text });
 
+  // The opening prompt names the conversation, the way the web UI titles it.
+  // Recorded before the turn runs so a session that errors out is still
+  // identifiable, and only when unset so later turns don't rename it.
+  const titled = client.listSessions(config.load(), conn.name)
+    .find((s) => s.sessionId === sessionId);
+  if (!titled || !titled.title)
+    client.rememberSession(conn.name, sessionId, { title: config.titleFrom(text) });
+
   const timeoutMs = flags.timeout ? Number(flags.timeout) * 1000 : 0;
   let res;
   try {
@@ -274,10 +428,17 @@ async function runTurn(conn, sessionId, text, flags) {
   const reply = collected || renderer && renderer.text() || '';
   config.appendTranscript(conn.name, sessionId, { type: 'reply', text: reply });
   config.appendTranscript(conn.name, sessionId, { type: 'stop', stopReason });
-  client.rememberSession(conn.name, sessionId, {
+  const bump = {
     turns: (client.listSessions(config.load(), conn.name)
       .find((s) => s.sessionId === sessionId) || {}).turns + 1 || 1,
-  });
+  };
+  // A turn that ran to the end is proof the session is live again, which
+  // matters after a daemon restart demoted the record: `send` with no session
+  // id picks the latest active one. A cancelled turn proves nothing -- it may
+  // have been paused (via `acp/pause`) by some other client, which owns the
+  // state until then.
+  if (stopReason !== 'cancelled') bump.state = 'active';
+  client.rememberSession(conn.name, sessionId, bump);
   return { stopReason, text: reply };
 }
 
@@ -285,12 +446,16 @@ async function cmdSend(cfg, rest, flags) {
   const agent = rest[0];
   if (!agent) die('usage: acp send <agent> [session] <message...>');
 
-  let sessionId = null;
   let words = rest.slice(1);
-  if (words.length > 1 && client.isKnownSession(cfg, agent, words[0])) {
-    sessionId = words[0];
-    words = words.slice(1);
-  }
+  // `acp send <agent> [session] <message...>`: the first word is a session id
+  // only if some session actually goes by it. The registry answers for the
+  // ones this machine started; the daemon is asked below for the rest.
+  const maybeId = words.length > 1 ? words[0] : null;
+  // A transcript counts as much as a record: it is what survives `session
+  // prune`, and it is proof this id named a real conversation.
+  let sessionId = maybeId && (client.isKnownSession(cfg, agent, maybeId)
+    || fs.existsSync(config.transcriptPath(agent, maybeId, false))) ? maybeId : null;
+  if (sessionId) words = words.slice(1);
   let message = words.join(' ').trim();
   if (!message && !process.stdin.isTTY) {
     message = fs.readFileSync(0, 'utf8').trim();
@@ -302,12 +467,20 @@ async function cmdSend(cfg, rest, flags) {
     onUpdate: (p) => { if (conn && conn.onUpdate) conn.onUpdate(p); },
   });
   try {
+    // Still unclaimed: a session started from the web UI, or one whose record
+    // was pruned, is live with nothing about it on this machine. Ask the
+    // daemon before sending its id off as the first word of the message.
+    if (!sessionId && maybeId && !flags.new
+        && await client.daemonHasSession(conn, maybeId)) {
+      sessionId = maybeId;
+      message = words.slice(1).join(' ').trim();
+    }
     if (!sessionId && !flags.new) {
       const latest = client.latestUsable(cfg, agent);
       if (latest) sessionId = latest.sessionId;
     }
     if (!sessionId) {
-      const res = await client.newSession(conn, flags.cwd);
+      const res = await client.newSession(conn, flags.cwd, flags.title);
       sessionId = res.sessionId;
       if (!flags.json && isTTY()) process.stderr.write(`(new session ${sessionId})\n`);
     }
@@ -470,19 +643,20 @@ AGENTS
       or  stdio:<command> (spawn an ACP agent locally, no daemon needed)
 
 SESSIONS
-  acp session ls [agent] [--remote]      list sessions (local registry by default)
-  acp session new <agent> [--cwd DIR]    start one, prints the session id
-  acp session pause  <agent> [session]   cancel the running turn, refuse new ones
-  acp session resume <agent> [session]   allow prompts again (reloads if needed)
+  acp session ls [agent] [--all]        list the sessions that are live now
+        [--local] [--remote]             --all: also ended  --local: registry only
+                                         --remote: one daemon and nothing else
+  acp session rename <agent> [s] <title> rename a session
   acp session close  <agent> [session]   end the session
-  acp session rm     <agent> [session]   end it and drop the local record
   acp session log    <agent> [session]   replay the transcript (--tail N)
+  acp session prune  [agent]             drop records the daemons no longer hold
 
-  \`acp session <agent> <verb>\` also works, e.g. acp session reviewer new
+  \`acp session <agent> <verb>\` also works, e.g. acp session reviewer close
 
 TALKING
   acp send <agent> [session] <message>   one turn; streams progress live
         --new       force a fresh session
+        --title "..."  name a session started by this call
         --quiet     print only the reply text
         --json      newline-delimited updates, then a final result object
         --thoughts  include the agent's reasoning
@@ -516,7 +690,7 @@ async function main(argv) {
     }
 
     case 'session': {
-      const VERBS = ['ls', 'list', 'new', 'close', 'pause', 'resume', 'rm', 'delete', 'log'];
+      const VERBS = ['ls', 'list', 'close', 'log', 'prune', 'rename'];
       let sub = args[0];
       let a = args.slice(1);
       // Accept `acp session <agent> <verb>` as well as `acp session <verb> <agent>`.
@@ -526,10 +700,10 @@ async function main(argv) {
         a = [agent, ...a.slice(1)];
       }
       if (sub === 'ls' || sub === 'list' || sub === undefined) return cmdSessionLs(cfg, a, flags);
-      if (sub === 'new') return cmdSessionNew(cfg, a, flags);
       if (sub === 'log') return cmdSessionLog(cfg, a, flags);
-      if (['close', 'pause', 'resume'].includes(sub)) return cmdSessionState(cfg, sub, a, flags);
-      if (sub === 'rm' || sub === 'delete') return cmdSessionState(cfg, 'rm', a, flags);
+      if (sub === 'prune') return cmdSessionPrune(cfg, a, flags);
+      if (sub === 'rename') return cmdSessionRename(cfg, a, flags);
+      if (sub === 'close') return cmdSessionClose(cfg, a, flags);
       return die(`unknown: acp session ${sub}`);
     }
 
