@@ -302,6 +302,28 @@ class Daemon {
         throw new RpcError(ERR.INVALID_PARAMS, `session ${p.sessionId} is closed`);
       }
       const entry = await this.agentFor(s.cwd);
+
+      // The real agent process that held this session died (crash, idle timeout, daemon
+      // restart) and agentFor() above just spawned a fresh one -- which knows nothing about
+      // this sessionId. Forwarding session/prompt straight to it used to fail with a bare
+      // "Internal error" from the fresh process's own unknown-session handling, since nothing
+      // here ever reloaded it first (acp/resume already did this exact reload, but only a
+      // caller that both hit the error AND happened to retry through acp/resume ever
+      // benefited -- every other caller, CLI or UI, just saw the failure). Reload
+      // transparently instead, the same way acp/resume does, so a stale session heals itself
+      // on the very next prompt.
+      if (s.state === 'stale') {
+        const caps = (entry.info && entry.info.agentCapabilities) || {};
+        if (!caps.loadSession) {
+          throw new RpcError(ERR.INTERNAL,
+            `session ${p.sessionId}'s agent process exited and this agent cannot reload sessions (loadSession not supported) -- start a new one`);
+        }
+        await entry.peer.request('session/load', {
+          sessionId: p.sessionId, cwd: path.resolve(s.cwd), mcpServers: [],
+        }, { timeoutMs: 120000 });
+        this.log(`session ${p.sessionId} reloaded from ${s.cwd} (was stale)`);
+      }
+
       s.owners.add(peer);
       s.state = 'active';
       s.turns += 1;
@@ -383,6 +405,17 @@ class Daemon {
       const s = this.mustSession(p.sessionId);
       const entry = await this.agentFor(s.cwd);
       return entry.peer.request('session/set_mode', p, { timeoutMs: 30000 });
+    });
+
+    // Forwarded the same way as session/set_mode just above -- was missing entirely, so the
+    // model/effort dropdowns in acp-ui's ChatFooterBar (which calls this via
+    // acpsession.ts#setConfigOption) silently failed: the request came back "method not found",
+    // the caller's unawaited-in-onChange promise rejection went nowhere visible, and the select
+    // just snapped back to its old value on the next render since nothing ever updated.
+    peer.handle('session/set_config_option', async (p) => {
+      const s = this.mustSession(p.sessionId);
+      const entry = await this.agentFor(s.cwd);
+      return entry.peer.request('session/set_config_option', p, { timeoutMs: 30000 });
     });
 
     // Answered from our own registry: it is the only place that knows the

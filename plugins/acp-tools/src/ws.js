@@ -16,7 +16,7 @@ const { EventEmitter } = require('node:events');
 // sides would agree on whatever wrong value), but it breaks the handshake
 // against any standards-compliant client -- a browser's native WebSocket
 // (acp-ui) included.
-const GUID = '258EAFA5-E914-47DA-95CA-5AB0DC85B39F';
+const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_MESSAGE = 64 * 1024 * 1024;
 
 const OP = { CONT: 0x0, TEXT: 0x1, BIN: 0x2, CLOSE: 0x8, PING: 0x9, PONG: 0xa };

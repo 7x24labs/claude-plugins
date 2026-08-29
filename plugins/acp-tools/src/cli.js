@@ -129,7 +129,7 @@ async function cmdAgentLs(cfg, rest, flags) {
   table(names.map((n) => {
     const a = cfg.agents[n];
     const live = authority.get(n);
-    if (live) return [n, a.url, a.cwd, live.length || '-'];
+    if (live) return [n, a.url, a.cwd, String(live.length)];
     const known = client.listSessions(cfg, n).filter((s) => s.state === 'active').length;
     return [n, a.url, a.cwd, known ? `${known}?` : '-'];
   }), ['NAME', 'URL', 'CWD', 'ACTIVE']);
